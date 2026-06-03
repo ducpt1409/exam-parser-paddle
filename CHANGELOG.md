@@ -1,0 +1,175 @@
+# Changelog
+
+Lịch sử thay đổi của `exam_parser_paddle`. Mỗi phase ghi rõ mục đích + file đã sửa.
+
+Format: `[Phase X.Y] - YYYY-MM-DD - Title`
+
+---
+
+## [Phase 1.0] - 2026-06-03 - Core pipeline implementation (Preprocess + PaddleOCR + Anchor)
+
+### Mục đích
+Implement 3 stage đầu của pipeline P4 để verify PaddleOCR + Anchor detection chạy đúng trên đề thật. Chưa cần Snake walker, VLM, Crop, MinIO upload - những phần đó để Phase 2-4.
+
+Output Phase này: PDF input → 2 file JSON (`blocks.json`, `anchors.json`) + `summary.txt` để debug và validate.
+
+### Đã thêm
+
+**`src/services/preprocess.py`** - Stage 1 (Preprocess)
+- `load_input(path, dpi)`: PDF → list[PIL.Image] qua PyMuPDF (300 DPI mặc định); ảnh JPG/PNG/... → PIL load trực tiếp
+- `deskew(img, threshold)`: detect góc nghiêng bằng OpenCV Hough transform, xoay nếu > 0.5°
+- `preprocess(path, dpi, do_deskew)`: orchestrator gộp load + deskew
+
+**`src/services/paddle_parser.py`** - Stage 2 (PaddleOCR PP-StructureV3 wrapper)
+- `PaddleParser` class với lazy load engine (load model 1 lần, reuse cho nhiều page)
+- `parse_page(image, page_index)` → `list[Block]` với bbox + text + type
+- `parse_pages(images)` → `list[list[Block]]`
+- Map PaddleOCR raw output → `Block`/`TextLine` Pydantic schemas
+- Hỗ trợ block types: text, title, list, table, figure, equation, header, footer
+- Table block lưu HTML structure trong `extra["table_html"]`
+
+**`src/services/anchor_extractor.py`** - Stage 3 (Anchor Extraction)
+- `strip_accents(text)`: bỏ dấu tiếng Việt → OCR-tolerant regex (`Câu` ≈ `Cau` ≈ `Cảu`)
+- `ANCHOR_PATTERNS` dict: regex cho 6 loại anchor (QUESTION, ANSWER, SUB_QUESTION, GROUP_HEADER, METADATA, FOOTER)
+- `extract_anchors(blocks_per_page)` → flat list[Anchor] với value, bbox, confidence
+- Priority matching: nếu 1 line match nhiều type, giữ type ưu tiên cao nhất (QUESTION > GROUP > ANSWER > ...)
+- Log breakdown anchor stats theo type
+
+**`scripts/parse_cli.py`** - CLI Phase 1 test
+- Args: `--input`, `--dpi`, `--no-deskew`, `--save-images`, `--debug`
+- Pipeline 3 stages + dump intermediate output
+- Output cấu trúc:
+  ```
+  output/{exam_id}/
+  ├── blocks.json    # PaddleOCR full output
+  ├── anchors.json   # extracted anchors
+  ├── summary.txt    # human-readable tóm tắt
+  └── pages/         # rendered images (nếu --save-images)
+  ```
+- Summary hiển thị: số pages, số blocks/lines, anchor count per type, top 20 question anchors
+
+### Đã sửa
+
+**`scripts/verify_setup.py`**
+- `check_paddle()`: hiển thị mode "GPU (CUDA)" hoặc "CPU only" thay vì fail nếu CPU-only
+- `check_paddle_inference()`: tự detect CPU/GPU mode, hiển thị `matmul {mode} 500x500 = Xms`
+- `check_paddleocr_inference()`: đọc env `PADDLE_USE_GPU`, hiển thị `(CPU, X.Xs)` hoặc `(GPU, X.Xs)`
+- `check_ollama_gpu()`: chấp nhận mixed CPU/GPU mode (76%/24%) là pass cho POC, không bắt buộc 100% GPU
+
+**`src/core/config.py`**
+- Default `paddle_use_gpu: bool = False` (RTX 5090 Blackwell sm_120 chưa được Paddle support)
+- Thêm `paddle_cpu_threads: int = 8` cho CPU mode
+
+**`.env.example`**
+- `PADDLE_USE_GPU=false` (default)
+- Thêm `PADDLE_CPU_THREADS=8`
+- Note rõ Blackwell limitation
+
+**`SETUP.md`**
+- §1 (Tổng quan): Paddle CPU thay GPU
+- §7 (PaddlePaddle): rewrite hoàn toàn - giải thích CUDA error 209 do thiếu sm_120 kernel, hướng dẫn cài Paddle CPU stable, trade-off CPU vs GPU
+- §10.2: đổi image Docker `minio/minio` → `quay.io/minio/minio` (tránh Docker Hub rate limit 100 pull/6h)
+- §10.4 (mới): tạo Access Key qua `mc admin user svcacct add` trong container (Community Edition Console không có UI Access Keys)
+- §10.5 (mới): hướng dẫn lưu credentials vào `.env`
+- §15 (checklist): update Paddle CPU check
+
+### Vấn đề đã giải quyết
+
+| Issue | Resolution |
+|---|---|
+| Docker Hub rate limit khi pull MinIO | Switch sang `quay.io/minio/minio` |
+| MinIO Community Edition không có UI Access Keys | Dùng `mc admin user svcacct add` trong container |
+| PyTorch `undefined symbol ncclCommResume` | Clean uninstall + cài PyTorch nightly cu128 (NCCL 2.29.7) |
+| Paddle GPU CUDA error 209 (no kernel for sm_120) | Switch Paddle sang CPU mode (`pip install paddlepaddle==3.0.0`) |
+| Ollama mixed CPU/GPU (24%/76%) | Accept cho POC - vẫn nhanh hơn pure CPU ~5x |
+
+### Verify
+
+```bash
+conda activate exam_parser_paddle
+
+# Verify environment
+python scripts/verify_setup.py
+# Expected: 16+/17 pass (Paddle = CPU mode, Ollama = GPU hoặc mixed)
+
+# Test Phase 1 với đề mẫu
+python scripts/parse_cli.py input/de_thi.pdf --save-images
+# Expected: blocks.json + anchors.json + summary.txt
+# Check: số question anchors ≈ số câu trong đề thật
+```
+
+### Next: Phase 2
+
+- [ ] Snake Walker (cross-page question extraction)
+- [ ] Question type classifier (rule-based)
+- [ ] Crop images (single page + multi-page stitch)
+
+---
+
+## [Phase 0.2] - 2026-06-03 - Documentation + flow
+
+### Mục đích
+Bổ sung tài liệu mô tả luồng hoạt động chi tiết để team hiểu architecture trước khi code.
+
+### Đã thêm
+
+**`PIPELINE_FLOW.md`** (16 sections)
+- Data flow giữa stages (schema transitions)
+- Chi tiết từng stage với pseudo-code + output mẫu
+- Snake Walker giải thích trực quan (ví dụ Câu vắt 2 trang)
+- Decision tree classify question type
+- Crop strategy cho multi-page
+- MinIO bucket structure
+- Output JSON schema mẫu đầy đủ
+- API sequence diagram
+- 6 edge cases + cách xử lý
+- Performance breakdown per stage trên RTX 5090
+- Debugging tools (preview PDF, verbose log, step dump)
+
+---
+
+## [Phase 0.1] - 2026-06-03 - Foundation setup
+
+### Mục đích
+Khởi tạo project với folder structure + setup environment + skeleton files. Chưa có business logic.
+
+### Đã thêm
+
+**Folder structure**
+```
+exam_parser_paddle/
+├── src/{api,core,services,schemas}/
+├── scripts/
+├── config/
+├── input/  output/  tests/
+```
+
+**Documentation**
+- `README.md` - Quick start + tech stack overview
+- `SETUP.md` - Hướng dẫn cài chi tiết (16 sections): WSL2, Miniconda, PyTorch CUDA 12.8, PaddlePaddle, PaddleOCR, Ollama + Qwen3-VL-32B, MinIO Docker
+- `.env.example` - Template 25+ env vars
+- `.gitignore`
+
+**Dependencies**
+- `requirements.txt` - PaddleOCR, PyMuPDF, OpenCV, Ollama client, FastAPI, MinIO SDK, Loguru, Click...
+- `docker-compose.yml` - MinIO container + auto bucket init
+
+**Source skeleton (Pydantic schemas + empty service files)**
+- `src/core/config.py` - Settings via pydantic-settings
+- `src/core/logging.py` - Loguru setup
+- `src/schemas/block.py` - Block, TextLine, BlockType
+- `src/schemas/anchor.py` - Anchor, AnchorType (6 types)
+- `src/schemas/exam.py` - Exam, Question, Answer, Group, QuestionType (9 types), CroppedImage
+- `src/services/*.py` - Empty placeholder cho mỗi stage
+- `src/api/main.py` - FastAPI app skeleton
+
+**Scripts**
+- `scripts/verify_setup.py` - Test 17 checks: Python, PyTorch CUDA + Blackwell, Paddle GPU, PaddleOCR inference, Ollama API + model + GPU, MinIO connection + bucket + upload/download
+- `scripts/parse_cli.py` - Skeleton (chưa implement logic)
+
+### Related design docs (parent folder)
+
+- `PROJECT_PLAN.md` - Full project plan + 10 scope decisions
+- `PADDLEOCR_HYBRID_APPROACHES.md` - So sánh 4 phương án P1/P2/P3/P4, recommend P4
+- `REGION_DETECTION_APPROACHES.md` - 4 approaches D/H/M/L (anchor-based)
+- `MINIO_SETUP.md` - MinIO local setup guide

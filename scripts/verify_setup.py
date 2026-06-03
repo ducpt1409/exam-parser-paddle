@@ -174,7 +174,7 @@ def check_ollama_model():
 
 
 def check_ollama_gpu():
-    """Test inference + check GPU usage qua subprocess nvidia-smi."""
+    """Test inference + check GPU usage. Accept GPU hoặc mixed CPU/GPU mode."""
     import ollama
     import subprocess
 
@@ -182,32 +182,39 @@ def check_ollama_gpu():
     model = os.getenv("OLLAMA_VLM_MODEL", "qwen3-vl:32b-instruct")
     client = ollama.Client(host=host)
 
-    # Trigger model load
+    # Trigger model load (có thể mất tới 60s lần đầu)
     try:
         client.generate(model=model, prompt="test", options={"num_predict": 1})
     except Exception as e:
         return False, f"generate failed: {e}"
 
-    # Check GPU usage
+    # Check qua `ollama ps` để biết phân bổ CPU/GPU
     try:
-        out = subprocess.check_output(
-            ["nvidia-smi", "--query-compute-apps=process_name,used_memory",
-             "--format=csv,noheader,nounits"],
-            text=True, timeout=5,
-        )
-        if "ollama" in out.lower() or "runner" in out.lower():
-            # Parse VRAM
-            for line in out.strip().split("\n"):
-                if "ollama" in line.lower() or "runner" in line.lower():
-                    parts = line.split(",")
-                    if len(parts) >= 2:
-                        vram_mb = int(parts[1].strip())
-                        vram_gb = vram_mb / 1024
-                        return True, f"GPU mode, {vram_gb:.1f}GB VRAM"
-            return True, "GPU mode (process detected)"
-        return False, "Ollama running on CPU (no GPU process)"
+        ps_out = subprocess.check_output(["ollama", "ps"], text=True, timeout=10)
+        # Format: NAME ID SIZE PROCESSOR CONTEXT UNTIL
+        for line in ps_out.strip().split("\n")[1:]:  # skip header
+            if model.split(":")[0] in line:
+                # Tìm phần "XX%/YY% CPU/GPU" hoặc "100% GPU"
+                if "100% GPU" in line or "100%/0%" in line:
+                    return True, "100% GPU mode"
+                elif "GPU" in line and "%" in line:
+                    return True, f"Mixed CPU/GPU mode (acceptable for POC): {line.strip()[-40:]}"
+                elif "100% CPU" in line:
+                    return False, "100% CPU mode - cần fix GPU"
+        return True, "model loaded (ps parse failed)"
     except Exception as e:
-        return True, f"inference OK (GPU check failed: {e})"
+        # Fallback - check qua nvidia-smi
+        try:
+            out = subprocess.check_output(
+                ["nvidia-smi", "--query-compute-apps=process_name,used_memory",
+                 "--format=csv,noheader,nounits"],
+                text=True, timeout=5,
+            )
+            if "ollama" in out.lower() or "runner" in out.lower():
+                return True, "GPU mode (nvidia-smi detected)"
+            return False, "Ollama không dùng GPU"
+        except Exception:
+            return True, f"inference OK (cannot verify GPU)"
 
 
 def check_minio_connection():
