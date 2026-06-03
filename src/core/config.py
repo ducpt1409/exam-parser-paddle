@@ -30,9 +30,11 @@ class Settings(BaseSettings):
     ollama_timeout: int = 120
 
     # --- PaddleOCR ---
-    paddle_use_gpu: bool = True
+    # Default False vì Paddle chưa support Blackwell sm_120 (RTX 5090)
+    paddle_use_gpu: bool = False
     paddle_ocr_lang: str = "vi"
     paddle_det_limit_side_len: int = 2400
+    paddle_cpu_threads: int = 8
 
     # --- Pipeline ---
     default_dpi: int = 300

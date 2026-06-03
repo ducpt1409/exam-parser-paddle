@@ -78,21 +78,30 @@ def check_pytorch_inference():
 
 
 def check_paddle():
+    """Check Paddle import + compile mode.
+
+    Lưu ý: với RTX 5090 (Blackwell), default dùng CPU mode (Paddle chưa support).
+    """
     import paddle
-    if not paddle.is_compiled_with_cuda():
-        return False, "PaddlePaddle compiled WITHOUT CUDA"
-    return True, f"version {paddle.__version__}"
+    mode = "GPU (CUDA)" if paddle.is_compiled_with_cuda() else "CPU only"
+    return True, f"version {paddle.__version__} - {mode}"
 
 
 def check_paddle_inference():
+    """Test inference. Tự detect CPU/GPU mode."""
     import paddle
-    x = paddle.randn([1000, 1000])
-    if paddle.is_compiled_with_cuda():
-        x = x.cuda()
+    use_gpu = paddle.is_compiled_with_cuda()
+    x = paddle.randn([500, 500])
+    if use_gpu:
+        try:
+            x = x.cuda()
+        except Exception:
+            use_gpu = False  # fallback CPU nếu GPU fail
     start = time.time()
     y = paddle.matmul(x, x)
     elapsed = (time.time() - start) * 1000
-    return True, f"matmul on {x.place} = {elapsed:.1f}ms"
+    mode = "GPU" if use_gpu else "CPU"
+    return True, f"matmul {mode} 500x500 = {elapsed:.1f}ms"
 
 
 def check_paddleocr_import():
@@ -129,11 +138,17 @@ def check_paddleocr_inference():
 
     arr = np.array(img)
 
+    # Đọc env để biết dùng GPU hay CPU
+    use_gpu = os.getenv("PADDLE_USE_GPU", "false").lower() == "true"
+
     ocr = PaddleOCR(use_angle_cls=False, lang="vi",
-                     use_gpu=True, show_log=False)
+                     use_gpu=use_gpu, show_log=False)
+    start = time.time()
     result = ocr.ocr(arr, cls=False)
+    elapsed = time.time() - start
     n_lines = len(result[0]) if result and result[0] else 0
-    return n_lines > 0, f"detected {n_lines} text lines"
+    mode = "GPU" if use_gpu else "CPU"
+    return n_lines > 0, f"detected {n_lines} lines ({mode}, {elapsed:.1f}s)"
 
 
 def check_ollama_connection():

@@ -13,8 +13,8 @@
 | 1 | WSL2 + nVidia Driver Windows | GPU passthrough | ✅ Bắt buộc |
 | 2 | Miniconda | Python env manager | ✅ Bắt buộc |
 | 3 | PyTorch CUDA 12.8 | Cho VLM (Ollama) + utils | ✅ Bắt buộc |
-| 4 | PaddlePaddle GPU | Backend cho PaddleOCR | ✅ Bắt buộc |
-| 5 | PaddleOCR | Layout + OCR | ✅ Bắt buộc |
+| 4 | PaddlePaddle **CPU** | Backend cho PaddleOCR (Blackwell chưa GPU support) | ✅ Bắt buộc |
+| 5 | PaddleOCR | Layout + OCR (CPU mode) | ✅ Bắt buộc |
 | 6 | Ollama + Qwen3-VL-32B | Semantic VLM | ✅ Bắt buộc |
 | 7 | MinIO (Docker) | Object storage | ✅ Bắt buộc |
 | 8 | PyMuPDF, Pillow, OpenCV | PDF/image processing | ✅ Auto cài qua pip |
@@ -119,53 +119,56 @@ pip install --pre torch torchvision --index-url https://download.pytorch.org/whl
 
 ---
 
-## 7. PaddlePaddle GPU - 3 cách (chọn 1)
+## 7. PaddlePaddle - CPU mode (Blackwell chưa support)
 
-⚠️ **Vấn đề**: PaddlePaddle stable hiện tại có thể CHƯA SUPPORT Blackwell sm_120. Cần thử theo thứ tự ưu tiên.
+⚠️ **QUAN TRỌNG**: RTX 5090 (Blackwell sm_120) **chưa được Paddle support** (tính đến 2026).
+Paddle stable 3.0.0 không có kernel sm_120 → mọi GPU operation fail với CUDA error 209
+"no kernel image is available for execution on the device".
 
-### Cách 7A: PaddlePaddle stable (thử trước)
+**Giải pháp POC**: Dùng Paddle CPU mode. PaddleOCR trên CPU mạnh (Ryzen 9 / Intel i9) đạt
+~3-6s/page - chấp nhận được cho POC. Khi Paddle release Blackwell support → switch GPU.
+
+### Cài Paddle CPU (CHỌN CÁCH NÀY)
 
 ```bash
-# Cài bản stable mới nhất
-python -m pip install paddlepaddle-gpu==3.0.0rc1 -i https://www.paddlepaddle.org.cn/packages/stable/cu123/
+# Package CPU - không cần CUDA libs Paddle
+pip install paddlepaddle==3.0.0
 
 # Verify
-python -c "import paddle; paddle.utils.run_check()"
+python -c "import paddle; print('CUDA:', paddle.is_compiled_with_cuda())"
+# Expected: CUDA: False  ← đúng (CPU mode)
+
+# Test inference
+python -c "
+import paddle
+x = paddle.randn([500, 500])
+y = paddle.matmul(x, x)
+print('CPU inference OK, shape:', y.shape)
+"
 ```
 
-**Output mong muốn**:
-```
-PaddlePaddle is installed successfully! Let's start deep Learning with PaddlePaddle now.
-```
+### (Tham khảo) Khi nào dùng GPU?
 
-Nếu chạy được → tiếp tục §8.
+Đợi 1 trong các điều kiện:
+- Paddle release version stable có sm_120 (theo dõi: https://github.com/PaddlePaddle/Paddle/releases)
+- Compile Paddle from source với `-arch=sm_120` (1-3 giờ build)
+- PaddleOCR Docker image official build cho Blackwell
 
-### Cách 7B: PaddlePaddle develop (nếu 7A fail)
-
+Khi GPU support có → switch:
 ```bash
-pip uninstall -y paddlepaddle paddlepaddle-gpu
-
-# Develop build (mới hơn, support GPU mới hơn)
-python -m pip install paddlepaddle-gpu==0.0.0.dev0 \
-  -f https://www.paddlepaddle.org.cn/whl/linux/cuda12.3-develop.html
-
-python -c "import paddle; paddle.utils.run_check()"
+pip uninstall -y paddlepaddle
+pip install paddlepaddle-gpu==X.X.X -i <official-blackwell-index>
+# Update .env: PADDLE_USE_GPU=true
 ```
 
-### Cách 7C: Docker container (nếu 7A, 7B fail)
+### Trade-off CPU vs GPU dự kiến
 
-Chạy PaddleOCR trong Docker isolated, gọi qua HTTP API. Pipeline Python local gọi qua mạng.
+| Stage | CPU (RTX 5090 box) | GPU (khi có Blackwell support) |
+|---|---|---|
+| PaddleOCR PP-Structure | ~3-6s/page | ~0.5-1s/page |
+| Throughput đề 10 trang | ~40-60s | ~10s |
 
-```bash
-# Pull image
-docker pull paddlepaddle/paddle:3.0.0rc1-gpu-cuda12.3-cudnn9.0
-
-# Test container
-docker run --rm --gpus all paddlepaddle/paddle:3.0.0rc1-gpu-cuda12.3-cudnn9.0 \
-  python -c "import paddle; paddle.utils.run_check()"
-```
-
-Sau đó setup PaddleOCR-serving (sẽ hướng dẫn ở §13 nếu cần).
+POC OK với CPU. Production optimize sau.
 
 ---
 
@@ -516,8 +519,8 @@ Nếu cần giảm memory:
 - [ ] Miniconda installed
 - [ ] Conda env `exam_parser_paddle` activated
 - [ ] PyTorch CUDA 12.8, archs có `sm_120`
-- [ ] PaddlePaddle `run_check()` pass
-- [ ] PaddleOCR import + inference OK
+- [ ] PaddlePaddle CPU import OK (`paddle.is_compiled_with_cuda()` = False)
+- [ ] PaddleOCR import + inference CPU OK
 - [ ] Ollama service running, GPU mode
 - [ ] Qwen3-VL-32B pulled
 - [ ] MinIO container running
