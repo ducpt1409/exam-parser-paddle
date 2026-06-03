@@ -6,6 +6,104 @@ Format: `[Phase X.Y] - YYYY-MM-DD - Title`
 
 ---
 
+## [Phase 2.3] - 2026-06-03 - Cropper + Debug Overlay + CLI tích hợp
+
+### Mục đích
+Crop ảnh từng câu hỏi / đáp án / passage từ page images, vẽ debug overlay có bbox màu để review thủ công, tích hợp toàn bộ Phase 2 vào CLI.
+
+### Đã thêm / sửa
+
+**`src/services/cropper.py`** — viết mới hoàn toàn
+- `_crop_region()`: crop 1 Region từ 1 trang, clamp bbox trong biên ảnh.
+- `_crop_multi_region()`: crop MultiRegion (hỗ trợ vắt trang → ghép dọc vertical stack).
+- `_make_cropped_image()`: crop + lưu PNG + tạo CroppedImage object (minio_key="" cho Phase 4).
+- `crop_question()`: crop full/content/từng đáp án cho 1 câu.
+- `crop_group_passage()`: crop passage cho 1 group.
+- `crop_all()`: điền CroppedImage in-place vào Exam + vẽ overlay.
+- `_draw_overlay()`: vẽ bbox màu lên ảnh gốc (🔴 group, 🔵 question, 🟣 content, 🟢 answer).
+- `_draw_rect()`: vẽ rectangle + label text góc trên trái.
+
+**`scripts/parse_cli.py`** — cập nhật từ Phase 1 [1/3] → [1/6]
+- Stage 4: Snake Walker → questions, groups, layouts.
+- Stage 5: Classifier → gán type.
+- Stage 6: Cropper → crop ảnh + overlay.
+- Thêm flag `--no-crop` để chạy nhanh tới classify.
+- Output: `exam.json`, `crops/`, `overlay/`.
+- Summary cập nhật: breakdown question type, group, metadata, needs_review.
+
+### Kết quả
+- Output structure đầy đủ: `exam.json` + `crops/` + `overlay/` + `summary.txt`.
+- Naming convention: `q{N}_full.png`, `q{N}_content.png`, `q{N}_{label}.png`, `g{k}_passage.png`.
+- Debug overlay: mỗi trang 1 ảnh với bbox màu theo spec §6.4.
+
+### Trade-off
+- ✅ Hỗ trợ cross-page crop (ghép dọc) cho câu vắt trang.
+- ✅ CroppedImage có width/height/size_bytes thật từ file PNG.
+- ⚠️ minio_key="" và url=local path → Phase 4 mới upload MinIO.
+- ⚠️ Dùng `ImageFont.load_default()` cho label overlay (không cần font riêng).
+
+---
+
+## [Phase 2.2] - 2026-06-03 - Question Type Classifier (rule-based)
+
+### Mục đích
+Phân loại QuestionType cho mỗi câu hỏi theo cây quyết định rule-based (KHÔNG dùng VLM).
+
+### Đã thêm
+
+**`src/services/question_classifier.py`** — viết mới hoàn toàn
+- `classify(question, group)` → QuestionType: cây quyết định theo §4.1.
+- `classify_all(questions, groups)`: gán type in-place cho toàn bộ questions.
+- Logic phân loại:
+  1. Group PASSAGE → READING_COMPREHENSION
+  2. n_answers >= 3 → MCQ_SINGLE (MCQ_MULTI nếu keyword "chọn nhiều")
+  3. n_answers == 0: sub-question → TRUE_FALSE, chỗ trống → FILL_BLANK, content dài → ESSAY, ngắn → SHORT_ANSWER
+  4. n_answers ∈ {1,2} → UNKNOWN + needs_review
+- Keyword lists: MCQ_MULTI, FILL_BLANK regex, ESSAY keywords.
+- MCQ nhưng đáp án ≠ 4 → needs_review.
+
+### Kết quả
+- Đề Toán 8: Câu 1-4 → MCQ_SINGLE, Câu 5-7 → ESSAY ✅
+- Đề Tiếng Anh: đa số MCQ_SINGLE, passage → READING_COMPREHENSION ✅
+
+### Trade-off
+- ✅ Hoàn toàn rule-based, không cần VLM → nhanh, deterministic.
+- ⚠️ Một số edge case phức tạp (matching, ordering) chưa detect → để UNKNOWN, Phase 3 VLM sẽ xử lý.
+
+---
+
+## [Phase 2.1] - 2026-06-03 - Snake Walker + Region dataclass
+
+### Mục đích
+Implement Snake Walker — thuật toán gom anchor thành Question/Group theo "con rắn" liên trang. Tạo Region/MultiRegion/QuestionLayout dataclass truyền từ Walker → Cropper.
+
+### Đã thêm
+
+**`src/services/snake_walker.py`** — viết mới hoàn toàn
+- Dataclass: `Region`, `MultiRegion`, `QuestionLayout` (§5 PHASE2_GUIDE).
+- `snake_walk()`: hàm chính — sort anchor, xác định ranh giới, gom block, tạo Question/Group.
+- `_find_solution_boundary()`: phát hiện phần lời giải (Azota §3.6b):
+  - Tìm marker text: "hết", "bảng đáp án", "lời giải chi tiết"
+  - Fallback: số câu nhảy lùi (không tăng đơn điệu)
+  - Loại anchor sau ranh giới → chỉ giữ phần câu hỏi
+- `_classify_group_type()`: phân loại GroupType từ header text (PASSAGE/SECTION_PART/INSTRUCTION).
+- `_compute_multi_region()`: tính MultiRegion hỗ trợ vắt trang (trang đầu/giữa/cuối).
+- `_check_continuity()`: kiểm tra số câu liên tục, đánh dấu needs_review.
+- `_parse_metadata()` / `parse_exam_metadata()`: parse mã đề, môn, thời gian, trường, năm học.
+
+### Kết quả
+- Đề Toán 8: 7 câu (1-7), có group SECTION_PART.
+- Đề Tiếng Anh: 50 câu (1-50), group PASSAGE + INSTRUCTION.
+- Đề Azota: phát hiện ranh giới lời giải → giữ 50 câu, loại phần giải.
+
+### Trade-off
+- ✅ Cross-page robust: câu vắt trang được tách region multi-page.
+- ✅ Edge case Azota: 2 cơ chế fallback (marker text + monotonic check).
+- ⚠️ Đáp án 2 cột (A,B trái; C,D phải): bbox answer tính theo anchor, chưa tách cột hoàn hảo.
+- ⚠️ Region tính từ block bbox — nếu layout model miss block thì vùng có thể hẹp hơn thực tế.
+
+---
+
 ## [Phase 1.2] - 2026-06-03 - Fix miss câu hỏi (block-type filter + regex điểm)
 
 ### Mục đích
