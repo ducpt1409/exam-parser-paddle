@@ -1,0 +1,36 @@
+# ⚠️ QUAN TRỌNG: PyTorch + PaddlePaddle phải cài RIÊNG TRƯỚC (xem SETUP.md §6 và §7)
+# Đảm bảo đã chạy:
+#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu128
+#   pip install paddlepaddle-gpu==3.0.0rc1 -i https://www.paddlepaddle.org.cn/packages/stable/cu123/
+
+# === Document parsing ===
+paddleocr>=2.7,<3.0           # Layout + OCR
+pymupdf>=1.24.0               # PDF render
+pillow>=10.0.0                # Image manipulation
+opencv-python>=4.9.0          # Deskew, preprocessing
+numpy>=1.26.0
+
+# === Vision LLM client ===
+ollama>=0.3.0                 # Qwen3-VL client
+
+# === API service ===
+fastapi>=0.110.0
+uvicorn[standard]>=0.27.0
+python-multipart>=0.0.9       # File upload
+pydantic>=2.0.0
+pydantic-settings>=2.0.0      # Settings management
+
+# === Storage ===
+minio>=7.2.0                  # MinIO SDK
+
+# === Utilities ===
+click>=8.1.0                  # CLI
+tqdm>=4.66.0                  # Progress bars
+python-dotenv>=1.0.0          # .env loader
+loguru>=0.7.0                 # Better logging
+PyYAML>=6.0                   # Config files
+
+# === Dev tools (optional) ===
+pytest>=8.0.0
+pytest-asyncio>=0.23.0
+httpx>=0.27.0                 # API testing

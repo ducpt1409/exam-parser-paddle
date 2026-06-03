@@ -1,0 +1,48 @@
+version: '3.8'
+
+# Docker Compose cho MinIO local storage
+# Ollama service được cài qua systemd (xem SETUP.md §9)
+
+services:
+  minio:
+    # Dùng Quay.io thay Docker Hub để tránh rate limit (100 pull/6h)
+    image: quay.io/minio/minio:latest
+    container_name: exam_parser_minio
+    restart: unless-stopped
+    ports:
+      - "9000:9000"   # S3 API
+      - "9001:9001"   # Web Console
+    volumes:
+      - minio_data:/data
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-admin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-admin12345}
+    command: server /data --console-address ":9001"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 30s
+      timeout: 20s
+      retries: 3
+
+  # Optional: bucket creator (chạy 1 lần để tạo bucket auto)
+  minio-init:
+    image: quay.io/minio/mc:latest
+    container_name: exam_parser_minio_init
+    depends_on:
+      minio:
+        condition: service_healthy
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-admin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-admin12345}
+    entrypoint: >
+      /bin/sh -c "
+      mc alias set local http://minio:9000 $$MINIO_ROOT_USER $$MINIO_ROOT_PASSWORD;
+      mc mb local/exam-parser --ignore-existing;
+      mc anonymous set download local/exam-parser;
+      echo 'Bucket exam-parser created and set to public download';
+      exit 0;
+      "
+
+volumes:
+  minio_data:
+    driver: local
