@@ -25,8 +25,10 @@ from src.schemas.block import Block, BlockType, TextLine
 #   - value_group_index: regex group chứa value (None nếu không có)
 ANCHOR_PATTERNS: dict[AnchorType, list[tuple[Pattern, int | None]]] = {
     AnchorType.QUESTION: [
-        # "Câu 1:", "Câu 1.", "Bài 1.", "Question 1:"
-        (re.compile(r"^\s*(?:cau|bai|question)\s+(\d+)\s*[\.\:]", re.IGNORECASE), 1),
+        # "Câu 1:", "Câu 1.", "Bài 1.", "Question 1:", "Câu 5 (4đ).", "Câu 6. (3đ)"
+        # Lookahead: sau số phải là khoảng trắng / . : ) ( hoặc hết dòng.
+        # → nuốt được phần điểm "(4đ)" nằm giữa số và dấu chấm.
+        (re.compile(r"^\s*(?:cau|bai|question)\s+(\d+)(?=[\s\.\:\)\(]|$)", re.IGNORECASE), 1),
         # "1." hoặc "1)" ở đầu dòng (cho tự luận đánh số)
         # CHỈ match nếu không có A-D ngay sau (tránh "1. A.")
         # (lower priority - check sau)
@@ -63,11 +65,13 @@ ANCHOR_PATTERNS: dict[AnchorType, list[tuple[Pattern, int | None]]] = {
     ],
 }
 
-# Text blocks acceptable for anchor extraction
-ANCHOR_BLOCK_TYPES = {
-    BlockType.TEXT, BlockType.TITLE, BlockType.LIST,
-    BlockType.HEADER, BlockType.FOOTER,
-}
+# LƯU Ý: KHÔNG filter theo block type khi extract anchor.
+# Layout model 'en' của PP-Structure phân loại sai nhiều vùng tiếng Việt /
+# cột đáp án thành 'figure'/'table' → nếu filter sẽ mất câu hỏi nằm trong đó
+# (đã quan sát: Q23-28 đề Anh, Câu 6-7 đề Toán bị nuốt vào block 'figure').
+# OCR text đáng tin hơn layout classification → quét tất cả block có text.
+# Riêng các block thuần ảnh (không có line text) tự khắc bị bỏ qua vì rỗng.
+SKIP_BLOCK_TYPES: set[BlockType] = set()
 
 
 def strip_accents(text: str) -> str:
@@ -120,7 +124,7 @@ def extract_anchors(blocks_per_page: list[list[Block]]) -> list[Anchor]:
 
     for blocks in blocks_per_page:
         for block in blocks:
-            if block.type not in ANCHOR_BLOCK_TYPES:
+            if block.type in SKIP_BLOCK_TYPES:
                 continue
             for line in block.lines:
                 text = line.text.strip()

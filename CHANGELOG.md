@@ -6,6 +6,52 @@ Format: `[Phase X.Y] - YYYY-MM-DD - Title`
 
 ---
 
+## [Phase 1.2] - 2026-06-03 - Fix miss câu hỏi (block-type filter + regex điểm)
+
+### Mục đích
+Sau khi chạy Phase 1.1 thành công trên 2 đề mẫu, phát hiện vẫn miss câu hỏi:
+- Đề Tiếng Anh: 44/50 câu (mất **Q23–28**)
+- Đề Toán 8: 4/7 câu (mất **Câu 5, 6, 7**)
+
+OCR đọc **đúng** toàn bộ text các câu này → lỗi nằm ở tầng anchor extraction, không phải OCR.
+
+### Vấn đề (2 bug gốc rễ)
+
+**Bug #1 — Block-type filter loại nhầm câu hỏi**
+`anchor_extractor` chỉ quét block thuộc `ANCHOR_BLOCK_TYPES` (TEXT/TITLE/LIST/HEADER/FOOTER),
+bỏ qua FIGURE/TABLE/EQUATION. Nhưng layout model `en` của PP-Structure phân loại **sai**
+nhiều vùng tiếng Việt / cột đáp án thành `figure`:
+- Đề Anh: cả Q23–28 nằm trong **1 block `figure`** → mất sạch 6 câu
+- Đề Toán: "Câu 6", "Câu 7" nằm trong block `figure` → mất
+
+**Bug #2 — Regex không nuốt được phần điểm `(Nđ)`**
+Pattern cũ `cau\s+(\d+)\s*[\.\:]` bắt buộc `.`/`:` ngay sau số.
+"Câu 5 **(4đ)**." có `(` chen giữa số và dấu chấm → không match (Câu 5 nằm block text vẫn miss).
+
+### Giải pháp
+
+**`src/services/anchor_extractor.py`**
+1. **Bỏ filter block type**: đổi `ANCHOR_BLOCK_TYPES` → `SKIP_BLOCK_TYPES = set()` (rỗng).
+   Quét tất cả block có text. Lý do: OCR text đáng tin, layout classification của model `en`
+   trên tài liệu tiếng Việt thì không. Block thuần ảnh (không có line) tự khắc bị bỏ qua.
+2. **Nới regex QUESTION** dùng lookahead:
+   `^\s*(?:cau|bai|question)\s+(\d+)(?=[\s\.\:\)\(]|$)`
+   → sau số chỉ cần là khoảng trắng / `.` / `:` / `)` / `(` / hết dòng → nuốt được "(4đ)".
+
+### Kết quả
+
+| Đề | Trước | Sau |
+|---|---|---|
+| Tiếng Anh | 44/50 | **50/50** ✅ |
+| Toán 8 | 4/7 | **7/7** ✅ |
+
+### Trade-off
+- ✅ Không còn miss câu do layout misclassification
+- ⚠️ Quét mọi block → tăng nhẹ khả năng false-positive anchor, nhưng pattern đủ chặt
+  (phải bắt đầu line bằng "Câu N" / "A." ...) + có human review ở POC nên chấp nhận được.
+
+---
+
 ## [Phase 1.1] - 2026-06-03 - Fix PaddleOCR Vietnamese support (tách Layout + OCR)
 
 ### Mục đích
