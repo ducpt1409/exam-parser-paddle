@@ -6,6 +6,51 @@ Format: `[Phase X.Y] - YYYY-MM-DD - Title`
 
 ---
 
+## [Phase 1.1] - 2026-06-03 - Fix PaddleOCR Vietnamese support (tách Layout + OCR)
+
+### Mục đích
+Fix lỗi `ppocr ERROR: lang latin is not support` khi chạy PP-Structure với `lang='vi'`.
+PP-Structure layout model chỉ hỗ trợ `en` và `ch`, không có Vietnamese.
+
+### Vấn đề
+```
+[2026/06/03 13:34:34] ppocr ERROR: lang latin is not support,
+we only support dict_keys(['en', 'ch']) for layout models
+```
+
+PaddleOCR PP-StructureV3 cố tự động chọn layout model cho 'vi' (→ map sang 'latin')
+nhưng không có model nào support → crash khi init.
+
+### Giải pháp - Tách Layout và OCR
+Thay vì 1 PPStructure xử lý cả layout + OCR, dùng 2 engine riêng:
+1. **PPStructure(`lang='en'`, `ocr=False`)**: chỉ làm layout detection (text/figure/table)
+2. **PaddleOCR(`lang='vi'`)**: Vietnamese OCR toàn trang
+3. **Merge logic**: gán OCR lines vào layout blocks theo bbox overlap (>=50% inside)
+4. **Orphan lines** (không thuộc block layout nào): tạo block TEXT riêng để không miss
+
+### Đã sửa
+
+**`src/services/paddle_parser.py`** - rewrite hoàn toàn `PaddleParser`
+- Thêm class constant `LAYOUT_LANG = "en"` (cho layout model)
+- Tách `_engine` → `_structure` (layout) + `_ocr` (Vietnamese OCR)
+- `_ensure_engines()`: lazy load cả 2 engines độc lập
+- `_parse_ocr_result()`: convert PaddleOCR raw output → list[TextLine]
+- `_convert_and_merge()`: gán OCR lines vào blocks theo bbox overlap, handle orphan lines
+- Thêm helper `_bbox_overlap_ratio(inner, outer)` để check containment
+
+### Trade-off
+- ✅ Hỗ trợ tốt mọi ngôn ngữ (OCR riêng) - không bị giới hạn của layout model
+- ✅ Không miss text (orphan lines vẫn được tạo block)
+- ⚠️ Chậm hơn ~30% vì chạy 2 inference (layout + OCR riêng), nhưng đỡ phụ thuộc PP-Structure internal
+- ⚠️ Overlap threshold 50% có thể cần tune nếu bbox layout chính xác không cao
+
+### Verify
+```bash
+python scripts/parse_cli.py input/de_thi.pdf
+```
+
+---
+
 ## [Phase 1.0] - 2026-06-03 - Core pipeline implementation (Preprocess + PaddleOCR + Anchor)
 
 ### Mục đích
