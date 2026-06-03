@@ -6,6 +6,58 @@ Format: `[Phase X.Y] - YYYY-MM-DD - Title`
 
 ---
 
+## [Phase 2.5] - 2026-06-03 - Fix vùng crop đáp án + reading-order + clip câu cuối
+
+### Mục đích
+Sau Phase 2.4, test lại `demau_toan8.pdf` (output 9e49b396) vẫn còn 4 lỗi VÙNG CROP
+(anchor đã đúng, nhưng region tính sai). Fix tại `snake_walker.py`.
+
+### Vấn đề & nguyên nhân (verify bằng dữ liệu thật)
+
+**Issue A — Đáp án A/D crop ra full-row (cả 4 đáp án).**
+Đáp án trắc nghiệm VN nằm CÙNG HÀNG (y gần bằng nhau, khác cột x). Cách cũ chia
+"dải y" giữa các anchor đáp án → khi y bằng nhau, dải rỗng (→ fallback full-width)
+hoặc gộp 2 đáp án.
+
+**Issue C — Câu 4 mất "= 0 là:", Câu 3 lẹm xuống Câu 4.**
+Phân số toán của Câu 4 render Ở TRÊN dòng chữ "Câu 4" (y < anchor) → gán nhầm sang Câu 3.
+
+**Issue D — Câu cuối (q7) nuốt "Chúc các em…/Đáp án/bảng đáp án".**
+Câu cuối lấy `end = (last_page, +inf)`.
+
+**Phụ — q4 đáp án C kéo dài xuống header "Phần II"** chen giữa Câu 4 và Câu 5.
+
+### Giải pháp (`src/services/snake_walker.py`)
+1. **Issue A — gán line vào anchor GẦN NHẤT** (Euclidean, phạt khác trang) thay chia dải y.
+   Xử lý đúng: cùng hàng, lưới 2x2, đáp án xuống dòng.
+2. **Issue C — `_compute_effective_starts()`**: mở rộng start câu lên trên để bao line
+   y-overlap ≥40% với dòng anchor & nằm bên phải (phân số là đuôi dòng "Câu N").
+3. **Issue D — `_find_content_end()`**: clip câu cuối tại marker kết thúc đề (Hết/Đáp án/
+   "chúc…làm bài"/bảng "1.C 2.B…"). Khác footer số trang → không clip nhầm đề nhiều trang.
+4. **Phụ — filter zone đáp án**: bỏ line dưới xa hàng đáp án cuối (> bottom + 1.2×line_h).
+5. Xoá `_clip_last_answer_lines` (không cần nữa).
+
+### Kết quả (verify qua simulation trên JSON — không cần chạy Paddle)
+| Câu | Trước | Sau |
+|---|---|---|
+| q1-q3 đáp án | A/D full-row | 4 cột hẹp tách bạch ✅ |
+| q4 content | mất "= 0 là:" | bao đủ phân số + "= 0 là:" ✅ |
+| q3 | lẹm xuống Câu 4 | end=1941, không lẹm ✅ |
+| q7 | nuốt tới bảng đáp án | clip tại "Chúc các em…" (y=2093) ✅ |
+| q4 đáp án C | kéo xuống "Phần II" | đúng ô [323,2388,539,2437] ✅ |
+
+### Còn lại (PHẠM VI SAU)
+- Đáp án trên CÙNG 1 OCR line thật sự (inline): bbox ước lượng theo tỉ lệ ký tự — toan8 không gặp.
+- content_text thứ tự từ với phân số hơi lộn xộn (text tham khảo — bbox crop ĐÚNG).
+- Reading-order phức tạp / 2 cột báo → cần VLM Phase 3.
+- has_figure dương tính giả khi cả trang là 1 figure-block (workaround: chỉ set khi line rỗng text).
+
+### Cần làm
+Chạy lại `parse_cli.py` trên CẢ 3 đề (toan8/tienganh/azota) trên WSL xác nhận không regression —
+đặc biệt đề Anh (đáp án xuống dòng) & azota (phân số nhiều).
+
+---
+
 ## [Phase 2.4] - 2026-06-03 - Fix line-granularity + answer regex + clip đáp án + inline answers
 
 ### Mục đích

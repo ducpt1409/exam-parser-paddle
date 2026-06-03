@@ -325,41 +325,82 @@ def _parse_metadata(
 # Bug 3 fix: Clip vùng đáp án cuối — không kéo tới câu sau
 # ============================================================
 
-def _clip_last_answer_lines(
-    a_lines: list[PositionedLine],
-    a_anchor: Anchor,
-) -> list[PositionedLine]:
-    """Clip các line ngoại lai khỏi đáp án cuối (Bug 3).
+def _y_overlap_ratio(b1: BBox, b2: BBox) -> float:
+    """Tỷ lệ overlap theo trục Y (so với chiều cao box thấp hơn)."""
+    lo = max(b1[1], b2[1])
+    hi = min(b1[3], b2[3])
+    if hi <= lo:
+        return 0.0
+    shorter = max(1.0, min(b1[3] - b1[1], b2[3] - b2[1]))
+    return (hi - lo) / shorter
 
-    Đáp án cuối có a_end = end-of-question (anchor câu kế), dễ bị gom
-    line thuộc câu sau (vd phân số render trước dòng "Câu N").
 
-    Thuật toán: chỉ giữ line cùng hàng hoặc sát dưới dòng đáp án.
+def _compute_effective_starts(
+    q_anchors: list[Anchor],
+    all_lines: list[PositionedLine],
+) -> list[float]:
+    """Tính 'effective start y' cho từng câu — fix reading-order (Issue C).
+
+    Vấn đề: nội dung toán (phân số, lũy thừa) render CAO HƠN dòng chữ "Câu N",
+    nên y_top của chúng < y_top anchor → bị gán nhầm sang câu TRƯỚC.
+
+    Heuristic: mở rộng start của câu LÊN TRÊN để bao các line cùng trang mà:
+      - y-overlap với dòng anchor >= 40% (cùng hàng thị giác), VÀ
+      - nằm bên phải dòng anchor (center x > center x anchor) → là phần đuôi
+        của chính dòng "Câu N" (vd phân số sau chữ "phương trình"), VÀ
+      - y_top nhỏ hơn y_top anchor (nằm phía trên).
+
+    Trả về list y aligned với q_anchors. Câu thường (không có gì overlap) →
+    giữ nguyên anchor.bbox[1] → KHÔNG ảnh hưởng đề text bình thường (Anh văn).
     """
-    if not a_lines:
-        return a_lines
+    starts: list[float] = []
+    for q in q_anchors:
+        a = q.bbox
+        anchor_cx = (a[0] + a[2]) / 2.0
+        min_y = a[1]
+        for ln in all_lines:
+            if ln.page_index != q.page_index:
+                continue
+            if ln.bbox == a:
+                continue
+            if (
+                ln.bbox[1] < a[1]
+                and _y_overlap_ratio(ln.bbox, a) >= 0.4
+                and ((ln.bbox[0] + ln.bbox[2]) / 2.0) > anchor_cx
+            ):
+                min_y = min(min_y, ln.bbox[1])
+        starts.append(min_y)
+    return starts
 
-    # Dòng đầu tiên của đáp án (anchor line)
-    first_y = a_anchor.bbox[1]
-    first_y_bottom = a_anchor.bbox[3]
-    line_height = first_y_bottom - first_y
-    if line_height <= 0:
-        line_height = 40  # fallback
 
-    # Giữ lại line trong khoảng hợp lý: cùng hàng hoặc ngay dưới
-    # Cho phép 1.5x line_height từ đáy dòng đầu tiên (bao gồm xuống dòng 1 lần)
-    max_y = first_y_bottom + 1.5 * line_height
+# Marker KẾT THÚC ĐỀ (phần câu hỏi) — KHÁC footer số trang.
+# Dùng để clip câu CUỐI, tránh nuốt "Hết / Chúc làm bài / Đáp án / bảng đáp án".
+_CONTENT_END_REGEX = re.compile(
+    r"^-*\s*het\s*-*$|"                      # ---hết---
+    r"^bang\s+dap\s+an|"                     # bảng đáp án
+    r"^dap\s*an\s*$|"                         # "Đáp án" đứng riêng (header)
+    r"chuc\s+.*lam\s+bai|"                   # chúc ... làm bài tốt
+    r"^\d+\s*[\.\)]\s*[A-D]\b.*\d+\s*[\.\)]\s*[A-D]",  # bảng "1.C 2.B 3.D ..."
+    re.IGNORECASE,
+)
 
-    clipped: list[PositionedLine] = []
-    for ln in a_lines:
-        if ln.page_index == a_anchor.page_index:
-            if ln.bbox[1] <= max_y:
-                clipped.append(ln)
-        else:
-            # Khác trang = vắt trang → giữ (hiếm gặp cho đáp án)
-            clipped.append(ln)
 
-    return clipped
+def _find_content_end(
+    all_lines: list[PositionedLine],
+    after_pos: tuple[int, float],
+) -> Optional[tuple[int, float]]:
+    """Tìm vị trí kết thúc phần đề (sau câu cuối) để clip — Issue D.
+
+    Trả về global position của marker kết thúc đầu tiên SAU after_pos,
+    hoặc None nếu không có (câu cuối kéo tới hết document).
+    """
+    for ln in all_lines:
+        if (ln.page_index, ln.bbox[1]) <= after_pos:
+            continue
+        norm = _strip_accents(ln.text.strip()).lower().strip()
+        if norm and _CONTENT_END_REGEX.search(norm):
+            return (ln.page_index, ln.bbox[1])
+    return None
 
 
 # ============================================================
@@ -427,6 +468,16 @@ def snake_walk(
         f"{len(all_lines)} lines, {len(page_heights)} trang"
     )
 
+    # Effective start y cho từng câu (fix reading-order Issue C) — aligned q_anchors
+    eff_starts = _compute_effective_starts(q_anchors, all_lines)
+
+    # Vị trí kết thúc phần đề (clip câu cuối — Issue D), tìm sau câu cuối cùng
+    content_end: Optional[tuple[int, float]] = None
+    if q_anchors:
+        content_end = _find_content_end(all_lines, _gpos_of_anchor(q_anchors[-1]))
+        if content_end:
+            logger.info(f"Content-end (clip câu cuối) tại page={content_end[0]}, y={content_end[1]:.0f}")
+
     # ================================================================
     # Bước 2+3 — Xác định ranh giới mỗi câu & gom LINES vào câu
     # ================================================================
@@ -443,13 +494,14 @@ def snake_walk(
             continue
 
         q_id = f"q{q_num}"
-        start = _gpos_of_anchor(q_anchor)
+        # Start = effective start (mở rộng lên trên cho phân số toán — Issue C)
+        start = (q_anchor.page_index, eff_starts[i])
 
-        # End = anchor câu kế tiếp hoặc cuối document
+        # End = effective start câu kế tiếp; câu cuối → content_end (Issue D) hoặc hết document
         if i + 1 < len(q_anchors):
-            end = _gpos_of_anchor(q_anchors[i + 1])
+            end = (q_anchors[i + 1].page_index, eff_starts[i + 1])
         else:
-            end = (last_page, inf_y)
+            end = content_end if content_end is not None else (last_page, inf_y)
 
         needs_review = False
 
@@ -548,29 +600,62 @@ def snake_walk(
             content_region = full_region
             content_text = " ".join(content_parts)
 
-        # --- Answer regions (Bug 3: clip đáp án cuối) ---
+        # --- Answer regions (Issue A) ---
+        # FIX: đáp án trắc nghiệm VN thường nằm CÙNG HÀNG (cùng y, khác x cột),
+        # nên cách cũ chia "dải y" giữa các anchor bị sai (dải rỗng → crop full-width,
+        # hoặc gộp 2 đáp án). Thay bằng: GÁN mỗi line vùng-đáp-án vào anchor GẦN NHẤT
+        # (theo khoảng cách tâm). Xử lý đúng mọi layout: cùng hàng, lưới 2x2, xuống dòng.
+        uniq_anchors: list[Anchor] = []
+        _seen_lbl: set[str] = set()
+        for a_anchor in q_answers_anchors:
+            lbl = a_anchor.value or ""
+            if lbl in _seen_lbl:
+                continue
+            _seen_lbl.add(lbl)
+            uniq_anchors.append(a_anchor)
+
+        # Các line thuộc vùng đáp án (từ đáp án đầu trở đi)
+        zone_lines = [
+            ln for ln in q_lines
+            if first_answer_pos is not None and _gpos_of_line(ln) >= first_answer_pos
+        ]
+        # Loại line nằm DƯỚI XA hàng đáp án cuối (vd group header "Phần II"
+        # chen giữa câu này và câu sau) — tránh kéo dài vùng đáp án xuống.
+        if uniq_anchors:
+            ans_bottom = max(a.bbox[3] for a in uniq_anchors)
+            _hs = sorted(a.bbox[3] - a.bbox[1] for a in uniq_anchors)
+            line_h = _hs[len(_hs) // 2] if _hs else 50.0
+            zone_lines = [ln for ln in zone_lines if ln.bbox[1] <= ans_bottom + 1.2 * line_h]
+
+        def _center(bb: BBox) -> tuple[float, float]:
+            return ((bb[0] + bb[2]) / 2.0, (bb[1] + bb[3]) / 2.0)
+
+        # Bucket bbox cho mỗi anchor (khởi tạo = bbox anchor)
+        buckets: dict[int, list[BBox]] = {k: [a.bbox] for k, a in enumerate(uniq_anchors)}
+        for ln in zone_lines:
+            lcx, lcy = _center(ln.bbox)
+            best_k, best_d = None, float("inf")
+            for k, a in enumerate(uniq_anchors):
+                acx, acy = _center(a.bbox)
+                # phạt khác trang để ưu tiên cùng trang
+                page_pen = 0.0 if a.page_index == ln.page_index else 1e6
+                d = ((lcx - acx) ** 2 + (lcy - acy) ** 2) ** 0.5 + page_pen
+                if d < best_d:
+                    best_d, best_k = d, k
+            if best_k is not None:
+                buckets[best_k].append(ln.bbox)
+
         answer_regions: list[tuple[str, MultiRegion]] = []
-        for j, a_anchor in enumerate(q_answers_anchors):
-            a_start = _gpos_of_anchor(a_anchor)
-            if j + 1 < len(q_answers_anchors):
-                a_end = _gpos_of_anchor(q_answers_anchors[j + 1])
-            else:
-                a_end = end  # đáp án cuối → ranh giới = end-of-question
-
-            a_lines = [
-                ln for ln in q_lines
-                if _in_range(_gpos_of_line(ln), a_start, a_end)
-            ]
-
-            # Bug 3 fix: clip đáp án cuối — không kéo tới câu sau
-            if j + 1 >= len(q_answers_anchors):
-                a_lines = _clip_last_answer_lines(a_lines, a_anchor)
-
-            a_region = _compute_multi_region_from_lines(
-                a_lines, a_start, a_end, page_heights, page_widths
+        for k, a_anchor in enumerate(uniq_anchors):
+            pidx = a_anchor.page_index
+            pw = page_widths[pidx] if pidx < len(page_widths) else 2550
+            ph = page_heights[pidx] if pidx < len(page_heights) else 3300
+            merged = _merge_bboxes(buckets[k])
+            padded = _pad_bbox(merged, pw, ph)
+            label = a_anchor.value or f"ans{k}"
+            answer_regions.append(
+                (label, MultiRegion(parts=[Region(page_index=pidx, bbox=padded)]))
             )
-            label = a_anchor.value or f"ans{j}"
-            answer_regions.append((label, a_region))
 
         # --- Confidence ---
         related_confidences = [q_anchor.confidence]
