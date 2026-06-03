@@ -1,8 +1,12 @@
 """Stage 4: Snake Walker — gom Anchor → Question/Group theo luồng "con rắn" liên trang.
 
 Ý tưởng: coi toàn bộ document như 1 dải liên tục nối các trang lại (global position).
-Sort anchor theo (page_index, y_top), xác định ranh giới mỗi câu, gom blocks + answers,
+Sort anchor theo (page_index, y_top), xác định ranh giới mỗi câu, gom LINES + answers,
 tạo Group, phát hiện phần lời giải (Azota) để loại bỏ, parse metadata.
+
+[Phase 2.4] Refactor: chuyển từ BLOCK granularity sang LINE granularity.
+Nguyên nhân: layout model 'en' gom cả trang thành 1 block figure →
+block.bbox vô nghĩa, nhưng line.bbox (từ OCR) luôn chính xác.
 
 Usage:
     from src.services.snake_walker import snake_walk
@@ -56,11 +60,29 @@ class QuestionLayout:
 
 
 # ============================================================
+# PositionedLine — đơn vị làm việc chính (Bug 1 fix)
+# ============================================================
+
+@dataclass
+class PositionedLine:
+    """1 dòng OCR + metadata block cha. Đơn vị cơ bản của snake walker.
+
+    Dùng line.bbox thay vì block.bbox vì layout model 'en' hay gom
+    cả trang thành 1 block figure — block.bbox vô nghĩa, nhưng
+    line.bbox (từ OCR engine) luôn chính xác.
+    """
+    page_index: int
+    bbox: BBox                 # bbox CỦA LINE (chính xác)
+    text: str
+    block_type: BlockType      # type của block cha (để biết figure/table/equation)
+    confidence: float = 1.0
+
+
+# ============================================================
 # Constants
 # ============================================================
 
-# Padding (px) khi tính bbox vùng
-PAD = 8
+PAD = 8  # Padding (px) khi tính bbox vùng
 
 # Từ khóa phát hiện ranh giới phần lời giải (strip dấu, lowercase)
 _SOLUTION_MARKERS = [
@@ -75,7 +97,7 @@ _SOLUTION_MARKERS = [
 _END_MARKERS_REGEX = re.compile(
     r"^-*\s*het\s*-*$|"                  # ---hết---
     r"^bang\s+dap\s+an|"                 # bảng đáp án
-    r"^\d+\s*[\.\)]\s*[A-D]\s+\d+\s*[\.\)]\s*[A-D]",  # 1.A 2.B ...
+    r"^\d+\s*[\.\\)]\s*[A-D]\s+\d+\s*[\.\\)]\s*[A-D]",  # 1.A 2.B ...
     re.IGNORECASE,
 )
 
@@ -100,8 +122,9 @@ def _gpos_of_anchor(a: Anchor) -> tuple[int, float]:
     return a.global_position()
 
 
-def _gpos_of_block(b: Block) -> tuple[int, float]:
-    return (b.page_index, b.bbox[1])
+def _gpos_of_line(ln: PositionedLine) -> tuple[int, float]:
+    """Global position của 1 line."""
+    return (ln.page_index, ln.bbox[1])
 
 
 def _in_range(pos: tuple[int, float],
@@ -155,43 +178,72 @@ def _classify_group_type(header_text: str) -> GroupType:
 
 
 # ============================================================
+# Bug 1 fix: Flatten blocks → lines
+# ============================================================
+
+def _flatten_lines(blocks_per_page: list[list[Block]]) -> list[PositionedLine]:
+    """Bung mọi block thành list line, mỗi line giữ bbox riêng + type block cha.
+
+    Đây là bước then chốt: layout model hay gom cả trang thành 1 block,
+    nhưng OCR line bbox luôn chính xác → dùng line làm đơn vị gom.
+    """
+    out: list[PositionedLine] = []
+    for page_blocks in blocks_per_page:
+        for blk in page_blocks:
+            if not blk.lines:
+                # Block visual thuần ảnh (không có text) — tạo 1 line placeholder
+                # để giữ bbox (cho has_figure detection)
+                out.append(PositionedLine(
+                    page_index=blk.page_index,
+                    bbox=blk.bbox,
+                    text="",
+                    block_type=blk.type,
+                    confidence=blk.confidence,
+                ))
+            else:
+                for ln in blk.lines:
+                    out.append(PositionedLine(
+                        page_index=blk.page_index,
+                        bbox=ln.bbox,
+                        text=ln.text,
+                        block_type=blk.type,
+                        confidence=ln.confidence,
+                    ))
+    out.sort(key=lambda l: (l.page_index, l.bbox[1]))
+    return out
+
+
+# ============================================================
 # Phát hiện & loại phần lời giải (Azota edge case §3.6b)
 # ============================================================
 
 def _find_solution_boundary(
     anchors: list[Anchor],
-    blocks_per_page: list[list[Block]],
+    all_lines: list[PositionedLine],
 ) -> Optional[tuple[int, float]]:
     """Tìm global position bắt đầu phần lời giải.
 
     Trả về None nếu không phát hiện (đề bình thường).
     """
-    # Cách 1: Tìm marker text trong blocks (Hết, bảng đáp án, lời giải chi tiết)
-    all_blocks_sorted: list[Block] = []
-    for page_blocks in blocks_per_page:
-        all_blocks_sorted.extend(page_blocks)
-    all_blocks_sorted.sort(key=lambda b: _gpos_of_block(b))
-
-    for block in all_blocks_sorted:
-        block_text = block.text.strip()
-        if not block_text:
+    # Cách 1: Tìm marker text trong lines
+    for ln in all_lines:
+        text = ln.text.strip()
+        if not text:
             continue
-        norm = _strip_accents(block_text).lower().strip()
+        norm = _strip_accents(text).lower().strip()
 
         # Check marker lời giải
         for marker in _SOLUTION_MARKERS:
             if marker in norm:
-                pos = _gpos_of_block(block)
-                logger.info(f"Phát hiện marker lời giải: \"{block_text}\" tại page={pos[0]}, y={pos[1]:.0f}")
+                pos = _gpos_of_line(ln)
+                logger.info(f"Phát hiện marker lời giải: \"{text}\" tại page={pos[0]}, y={pos[1]:.0f}")
                 return pos
 
         # Check "hết" / bảng đáp án
-        for line in block.lines:
-            line_norm = _strip_accents(line.text.strip()).lower().strip()
-            if _END_MARKERS_REGEX.match(line_norm):
-                pos = (block.page_index, line.bbox[1])
-                logger.info(f"Phát hiện marker kết thúc: \"{line.text.strip()}\" tại page={pos[0]}, y={pos[1]:.0f}")
-                return pos
+        if _END_MARKERS_REGEX.match(norm):
+            pos = _gpos_of_line(ln)
+            logger.info(f"Phát hiện marker kết thúc: \"{text}\" tại page={pos[0]}, y={pos[1]:.0f}")
+            return pos
 
     # Cách 2 (Fallback): Kiểm tra số câu không tăng đơn điệu
     q_anchors = sorted(
@@ -204,7 +256,6 @@ def _find_solution_boundary(
             n = a.number
             if n is not None:
                 if n <= max_seen and max_seen > 1:
-                    # Số câu nhảy lùi → bắt đầu phần lời giải
                     pos = _gpos_of_anchor(a)
                     logger.info(
                         f"Fallback: số câu nhảy lùi (Câu {n} sau max={max_seen}) "
@@ -228,58 +279,87 @@ def _parse_metadata(
     """Parse metadata từ anchor METADATA + blocks đầu trang 1."""
     meta = ExamMetadata(tong_so_cau=n_questions)
 
-    # Thu thập text metadata từ anchors
     meta_texts: list[str] = []
     for a in anchors:
         if a.type == AnchorType.METADATA:
             meta_texts.append(a.text)
 
-    # Thêm text từ vài block đầu trang 1
     if blocks_per_page:
-        for block in blocks_per_page[0][:10]:  # 10 blocks đầu
+        for block in blocks_per_page[0][:10]:
             meta_texts.append(block.text)
 
     full_text = "\n".join(meta_texts)
     norm = _strip_accents(full_text).lower()
 
-    # Mã đề
     m = re.search(r"ma\s+de[:\s]*(\d+)", norm)
     if m:
         meta.ma_de = m.group(1)
 
-    # Thời gian
     m = re.search(r"thoi\s+gian[:\s]*(\d+)\s*(?:phut)?", norm)
     if m:
         meta.thoi_gian_phut = int(m.group(1))
 
-    # Môn
     m = re.search(r"mon[:\s]+([^\n\r]+)", norm)
     if m:
-        # Lấy text gốc (có dấu) tương ứng vị trí match
         raw_m = re.search(r"[Mm][oôơ]n[:\s]+([^\n\r]+)", full_text)
         if raw_m:
             meta.mon = raw_m.group(1).strip()
         else:
             meta.mon = m.group(1).strip()
 
-    # Trường
     for pattern in [r"truong\s+(?:thpt|thcs|th)[:\s]*([^\n\r]+)",
                     r"so\s+gd[:\s]*([^\n\r]+)"]:
         m = re.search(pattern, norm)
         if m:
-            raw_m = re.search(pattern.replace("truong", "[Tt]r[ưu][oờơ]ng"), full_text)
-            if raw_m:
-                meta.truong = raw_m.group(1).strip()
-            else:
-                meta.truong = m.group(1).strip()
+            meta.truong = m.group(1).strip()
             break
 
-    # Năm học
     m = re.search(r"nam\s+hoc[:\s]*(\d{4}\s*[-–]\s*\d{4})", norm)
     if m:
         meta.nam_hoc = m.group(1).strip()
 
     return meta
+
+
+# ============================================================
+# Bug 3 fix: Clip vùng đáp án cuối — không kéo tới câu sau
+# ============================================================
+
+def _clip_last_answer_lines(
+    a_lines: list[PositionedLine],
+    a_anchor: Anchor,
+) -> list[PositionedLine]:
+    """Clip các line ngoại lai khỏi đáp án cuối (Bug 3).
+
+    Đáp án cuối có a_end = end-of-question (anchor câu kế), dễ bị gom
+    line thuộc câu sau (vd phân số render trước dòng "Câu N").
+
+    Thuật toán: chỉ giữ line cùng hàng hoặc sát dưới dòng đáp án.
+    """
+    if not a_lines:
+        return a_lines
+
+    # Dòng đầu tiên của đáp án (anchor line)
+    first_y = a_anchor.bbox[1]
+    first_y_bottom = a_anchor.bbox[3]
+    line_height = first_y_bottom - first_y
+    if line_height <= 0:
+        line_height = 40  # fallback
+
+    # Giữ lại line trong khoảng hợp lý: cùng hàng hoặc ngay dưới
+    # Cho phép 1.5x line_height từ đáy dòng đầu tiên (bao gồm xuống dòng 1 lần)
+    max_y = first_y_bottom + 1.5 * line_height
+
+    clipped: list[PositionedLine] = []
+    for ln in a_lines:
+        if ln.page_index == a_anchor.page_index:
+            if ln.bbox[1] <= max_y:
+                clipped.append(ln)
+        else:
+            # Khác trang = vắt trang → giữ (hiếm gặp cho đáp án)
+            clipped.append(ln)
+
+    return clipped
 
 
 # ============================================================
@@ -294,26 +374,21 @@ def snake_walk(
 ) -> tuple[list[Question], list[Group], dict[str, QuestionLayout], dict[str, MultiRegion]]:
     """Snake Walker — gom anchor thành Question/Group.
 
-    Args:
-        blocks_per_page: list[list[Block]] — output PaddleParser.
-        anchors: list[Anchor] — output extract_anchors (chưa sort).
-        page_heights: chiều cao pixel mỗi trang.
-        page_widths: chiều rộng pixel mỗi trang.
-
-    Returns:
-        (questions, groups, question_layouts, group_layouts)
-        - questions: list[Question] đã gom, type=UNKNOWN (Classifier sẽ gán sau).
-        - groups: list[Group] với question_ids.
-        - question_layouts: dict[question_id → QuestionLayout] cho Cropper.
-        - group_layouts: dict[group_id → MultiRegion] cho passage crop.
+    [Phase 2.4] Refactored: dùng LINE granularity thay BLOCK granularity.
     """
     last_page = len(page_heights) - 1
     inf_y = float("inf")
 
     # ================================================================
-    # Bước 0 — Phát hiện & loại phần lời giải (Azota §3.6b)
+    # Bước 0a — Flatten blocks → lines (Bug 1 fix)
     # ================================================================
-    solution_boundary = _find_solution_boundary(anchors, blocks_per_page)
+    all_lines = _flatten_lines(blocks_per_page)
+    logger.info(f"Snake Walker: flatten {sum(len(b) for b in blocks_per_page)} blocks → {len(all_lines)} lines")
+
+    # ================================================================
+    # Bước 0b — Phát hiện & loại phần lời giải (Azota §3.6b)
+    # ================================================================
+    solution_boundary = _find_solution_boundary(anchors, all_lines)
 
     if solution_boundary is not None:
         original_count = len([a for a in anchors if a.type == AnchorType.QUESTION])
@@ -346,25 +421,18 @@ def snake_walk(
         key=_gpos_of_anchor,
     )
 
-    # Flatten tất cả blocks, sort theo global position
-    all_blocks: list[Block] = []
-    for page_blocks in blocks_per_page:
-        all_blocks.extend(page_blocks)
-    all_blocks.sort(key=_gpos_of_block)
-
     logger.info(
         f"Snake Walker input: {len(q_anchors)} câu, {len(answer_anchors)} đáp án, "
         f"{len(sub_anchors)} sub, {len(group_anchors)} group, "
-        f"{len(all_blocks)} blocks, {len(page_heights)} trang"
+        f"{len(all_lines)} lines, {len(page_heights)} trang"
     )
 
     # ================================================================
-    # Bước 2 — Xác định ranh giới mỗi câu
+    # Bước 2+3 — Xác định ranh giới mỗi câu & gom LINES vào câu
     # ================================================================
     questions: list[Question] = []
     layouts: dict[str, QuestionLayout] = {}
 
-    # Theo dõi tính liên tục số câu
     seen_numbers: set[int] = set()
     prev_number: Optional[int] = None
 
@@ -383,59 +451,52 @@ def snake_walk(
         else:
             end = (last_page, inf_y)
 
-        # --- Kiểm tra bất thường ---
         needs_review = False
 
-        # Trùng số câu
+        # Trùng số câu → bỏ qua (giữ cái đầu)
         if q_num in seen_numbers:
             logger.warning(f"Trùng số câu: Câu {q_num}")
-            needs_review = True
-            # Bỏ qua câu trùng (giữ cái đầu)
             continue
         seen_numbers.add(q_num)
 
         # Số không liên tục
-        if prev_number is not None and q_num != prev_number + 1:
-            if q_num > prev_number + 1:
-                logger.warning(f"Số câu không liên tục: nhảy từ {prev_number} sang {q_num}")
-                needs_review = True
+        if prev_number is not None and q_num > prev_number + 1:
+            logger.warning(f"Số câu không liên tục: nhảy từ {prev_number} sang {q_num}")
+            needs_review = True
         prev_number = q_num
 
-        # ================================================================
-        # Bước 3 — Gom blocks vào câu
-        # ================================================================
-        q_blocks: list[Block] = []
-        for block in all_blocks:
-            bpos = _gpos_of_block(block)
-            if _in_range(bpos, start, end):
-                q_blocks.append(block)
+        # --- Gom LINES vào câu (Bug 1: dùng line bbox thay block bbox) ---
+        q_lines: list[PositionedLine] = [
+            ln for ln in all_lines
+            if _in_range(_gpos_of_line(ln), start, end)
+        ]
 
-        if not q_blocks:
-            logger.warning(f"Câu {q_num}: không có block nào → needs_review")
+        if not q_lines:
+            logger.warning(f"Câu {q_num}: không có line nào → needs_review")
             needs_review = True
 
         # Page indices
-        page_indices = sorted(set(b.page_index for b in q_blocks)) if q_blocks else [q_anchor.page_index]
+        page_indices = sorted(set(ln.page_index for ln in q_lines)) if q_lines else [q_anchor.page_index]
 
-        # Content text (concat text các block)
+        # Content text + flags (dùng line text & block_type)
         content_parts: list[str] = []
         has_figure = False
         has_table = False
         has_formula = False
 
-        for b in q_blocks:
-            if b.type == BlockType.FIGURE:
+        for ln in q_lines:
+            # has_figure: chỉ set nếu line rỗng text thuộc block figure
+            # (figure thật không có text, trang gom figure giả có text)
+            if ln.block_type == BlockType.FIGURE and not ln.text.strip():
                 has_figure = True
-            elif b.type == BlockType.TABLE:
+            elif ln.block_type == BlockType.TABLE and not ln.text.strip():
                 has_table = True
-            elif b.type == BlockType.EQUATION:
+            elif ln.block_type == BlockType.EQUATION:
                 has_formula = True
-            if b.text.strip():
-                content_parts.append(b.text.strip())
+            if ln.text.strip():
+                content_parts.append(ln.text.strip())
 
-        # ================================================================
-        # Bước 3b — Gom answers vào câu
-        # ================================================================
+        # --- Gom answers vào câu ---
         q_answers_anchors: list[Anchor] = [
             a for a in answer_anchors
             if _in_range(_gpos_of_anchor(a), start, end)
@@ -445,7 +506,7 @@ def snake_walk(
             if _in_range(_gpos_of_anchor(a), start, end)
         ]
 
-        # Tạo Answer objects
+        # Tạo Answer objects (loại trùng label)
         answers: list[Answer] = []
         seen_labels: set[str] = set()
         for a_anchor in q_answers_anchors:
@@ -455,66 +516,63 @@ def snake_walk(
                 needs_review = True
                 continue
             seen_labels.add(label)
-
-            # Text đáp án = text của anchor line
-            a_text = a_anchor.text.strip()
-            answers.append(Answer(label=label, text=a_text))
+            answers.append(Answer(label=label, text=a_anchor.text.strip()))
 
         # ================================================================
         # Bước 4 — Tách content vs answers region (cho crop)
         # ================================================================
-        # Content region: từ đầu câu → trước answer/sub đầu tiên
-        # Answer region: từng answer anchor → answer kế hoặc hết câu
-
         first_answer_pos: Optional[tuple[int, float]] = None
         if q_answers_anchors:
             first_answer_pos = _gpos_of_anchor(q_answers_anchors[0])
         elif q_sub_anchors:
             first_answer_pos = _gpos_of_anchor(q_sub_anchors[0])
 
-        # --- Full region ---
-        full_region = _compute_multi_region(
-            q_blocks, start, end, page_heights, page_widths
+        # --- Full region (từ lines) ---
+        full_region = _compute_multi_region_from_lines(
+            q_lines, start, end, page_heights, page_widths
         )
 
         # --- Content region ---
         if first_answer_pos:
-            content_blocks = [
-                b for b in q_blocks
-                if _gpos_of_block(b) < first_answer_pos
+            content_lines = [
+                ln for ln in q_lines
+                if _gpos_of_line(ln) < first_answer_pos
             ]
-            content_region = _compute_multi_region(
-                content_blocks, start, first_answer_pos, page_heights, page_widths
+            content_region = _compute_multi_region_from_lines(
+                content_lines, start, first_answer_pos, page_heights, page_widths
             )
-            # Chỉ lấy content text (không bao gồm đáp án)
             content_text = " ".join(
-                b.text.strip() for b in content_blocks if b.text.strip()
+                ln.text.strip() for ln in content_lines if ln.text.strip()
             )
         else:
-            # Không có đáp án → toàn bộ là content (tự luận)
             content_region = full_region
             content_text = " ".join(content_parts)
 
-        # --- Answer regions ---
+        # --- Answer regions (Bug 3: clip đáp án cuối) ---
         answer_regions: list[tuple[str, MultiRegion]] = []
         for j, a_anchor in enumerate(q_answers_anchors):
             a_start = _gpos_of_anchor(a_anchor)
             if j + 1 < len(q_answers_anchors):
                 a_end = _gpos_of_anchor(q_answers_anchors[j + 1])
             else:
-                a_end = end  # hết câu
+                a_end = end  # đáp án cuối → ranh giới = end-of-question
 
-            a_blocks = [
-                b for b in q_blocks
-                if _in_range(_gpos_of_block(b), a_start, a_end)
+            a_lines = [
+                ln for ln in q_lines
+                if _in_range(_gpos_of_line(ln), a_start, a_end)
             ]
-            a_region = _compute_multi_region(
-                a_blocks, a_start, a_end, page_heights, page_widths
+
+            # Bug 3 fix: clip đáp án cuối — không kéo tới câu sau
+            if j + 1 >= len(q_answers_anchors):
+                a_lines = _clip_last_answer_lines(a_lines, a_anchor)
+
+            a_region = _compute_multi_region_from_lines(
+                a_lines, a_start, a_end, page_heights, page_widths
             )
             label = a_anchor.value or f"ans{j}"
             answer_regions.append((label, a_region))
 
-        # --- Tính confidence ---
+        # --- Confidence ---
         related_confidences = [q_anchor.confidence]
         for a in q_answers_anchors:
             related_confidences.append(a.confidence)
@@ -565,10 +623,9 @@ def snake_walk(
 
             g_type = _classify_group_type(g_anchor.text)
 
-            # Tìm câu hỏi thuộc group này
+            # Tìm câu hỏi thuộc group
             g_question_ids: list[str] = []
             for q in questions:
-                # Câu thuộc group nếu anchor câu nằm trong [g_start, g_end)
                 q_anchor_match = None
                 for qa in q_anchors:
                     if qa.number == q.number:
@@ -580,12 +637,11 @@ def snake_walk(
                         g_question_ids.append(q.id)
                         q.group_id = g_id
 
-            # Passage text: blocks giữa group header và câu đầu tiên
+            # Passage text: lines giữa group header và câu đầu tiên
             passage_text = ""
             passage_region = MultiRegion()
 
             if g_type == GroupType.PASSAGE and g_question_ids:
-                # Tìm câu đầu tiên trong group
                 first_q_in_group = None
                 for q in questions:
                     if q.id == g_question_ids[0]:
@@ -600,18 +656,17 @@ def snake_walk(
                             break
 
                     if first_q_anchor:
-                        passage_start = _gpos(g_anchor.page_index, g_anchor.bbox[3])  # dưới header
+                        passage_start = _gpos(g_anchor.page_index, g_anchor.bbox[3])
                         passage_end = _gpos_of_anchor(first_q_anchor)
 
-                        passage_blocks = [
-                            b for b in all_blocks
-                            if _in_range(_gpos_of_block(b), passage_start, passage_end)
+                        passage_lines = [
+                            ln for ln in all_lines
+                            if _in_range(_gpos_of_line(ln), passage_start, passage_end)
+                            and ln.text.strip()  # chỉ line có text
                         ]
-                        passage_text = " ".join(
-                            b.text.strip() for b in passage_blocks if b.text.strip()
-                        )
-                        passage_region = _compute_multi_region(
-                            passage_blocks, passage_start, passage_end,
+                        passage_text = " ".join(ln.text.strip() for ln in passage_lines)
+                        passage_region = _compute_multi_region_from_lines(
+                            passage_lines, passage_start, passage_end,
                             page_heights, page_widths
                         )
 
@@ -629,32 +684,28 @@ def snake_walk(
 
     logger.info(f"Snake Walker: tạo {len(groups)} groups")
 
-    # Kiểm tra số câu không liên tục (đánh dấu review)
     _check_continuity(questions)
 
     return questions, groups, layouts, group_layouts
 
 
 # ============================================================
-# Helper: Compute MultiRegion từ tập blocks
+# Helper: Compute MultiRegion từ tập LINES (Bug 1 fix)
 # ============================================================
 
-def _compute_multi_region(
-    blocks: list[Block],
+def _compute_multi_region_from_lines(
+    lines: list[PositionedLine],
     start: tuple[int, float],
     end: tuple[int, float],
     page_heights: list[float],
     page_widths: list[float],
 ) -> MultiRegion:
-    """Tính MultiRegion từ tập blocks, hỗ trợ vắt trang.
+    """Tính MultiRegion từ tập PositionedLine, hỗ trợ vắt trang.
 
-    Nếu vùng trải nhiều trang → tách thành nhiều Region (mỗi trang 1 part).
-    Part trang đầu: từ y_top câu xuống đáy trang.
-    Part trang cuối: từ đỉnh tới y_bottom.
-    Part trang giữa: full chiều cao.
+    Dùng line.bbox thay block.bbox → bbox chính xác dù layout model
+    gom cả trang thành 1 block.
     """
-    if not blocks:
-        # Fallback: tạo region từ start position
+    if not lines:
         page_idx = start[0]
         if page_idx < len(page_heights):
             pw = page_widths[page_idx]
@@ -666,28 +717,22 @@ def _compute_multi_region(
             return MultiRegion(parts=[Region(page_index=page_idx, bbox=bbox)])
         return MultiRegion()
 
-    # Nhóm blocks theo trang
-    pages_involved = sorted(set(b.page_index for b in blocks))
+    pages_involved = sorted(set(ln.page_index for ln in lines))
 
     parts: list[Region] = []
     for page_idx in pages_involved:
-        page_blocks = [b for b in blocks if b.page_index == page_idx]
-        if not page_blocks:
+        page_lines = [ln for ln in lines if ln.page_index == page_idx]
+        if not page_lines:
             continue
 
         pw = page_widths[page_idx] if page_idx < len(page_widths) else 2550
         ph = page_heights[page_idx] if page_idx < len(page_heights) else 3300
 
-        # Tính bbox bao các blocks trên trang này
-        bboxes = [b.bbox for b in page_blocks]
-        # Thêm bbox các lines riêng lẻ để chính xác hơn
-        for b in page_blocks:
-            for line in b.lines:
-                bboxes.append(line.bbox)
-
+        # Tính bbox bao từ LINE bbox (chính xác)
+        bboxes = [ln.bbox for ln in page_lines]
         merged = _merge_bboxes(bboxes)
 
-        # Điều chỉnh cho trang đầu/cuối/giữa khi vắt trang
+        # Điều chỉnh cho vắt trang
         if len(pages_involved) > 1:
             if page_idx == pages_involved[0]:
                 # Trang đầu: từ y_top câu đến đáy trang
@@ -715,7 +760,6 @@ def _check_continuity(questions: list[Question]) -> None:
         curr = sorted_q[i].number
         next_num = sorted_q[i + 1].number
         if next_num != curr + 1:
-            # Đánh dấu các câu quanh chỗ đứt
             sorted_q[i].needs_review = True
             sorted_q[i + 1].needs_review = True
             logger.warning(

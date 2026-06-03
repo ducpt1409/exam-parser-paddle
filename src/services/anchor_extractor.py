@@ -35,11 +35,13 @@ ANCHOR_PATTERNS: dict[AnchorType, list[tuple[Pattern, int | None]]] = {
     ],
     AnchorType.ANSWER: [
         # "A.", "B.", "C.", "D." ở đầu dòng - đáp án trắc nghiệm
-        (re.compile(r"^\s*([A-D])\s*[\.\)]\s+\S"), 1),
+        # Bug 2 fix: \s+ → \s* (cho phép 0 khoảng trắng, vd OCR "B.m =4")
+        (re.compile(r"^\s*([A-D])\s*[\.\)]\s*\S"), 1),
     ],
     AnchorType.SUB_QUESTION: [
         # "a)", "b)", "c)", "d)" - đúng/sai
-        (re.compile(r"^\s*([a-d])\s*\)\s+\S"), 1),
+        # Bug 2 fix: \s+ → \s*
+        (re.compile(r"^\s*([a-d])\s*\)\s*\S"), 1),
     ],
     AnchorType.GROUP_HEADER: [
         (re.compile(r"^\s*(phan)\s+[ivxlcdm\d]", re.IGNORECASE), None),
@@ -72,6 +74,10 @@ ANCHOR_PATTERNS: dict[AnchorType, list[tuple[Pattern, int | None]]] = {
 # OCR text đáng tin hơn layout classification → quét tất cả block có text.
 # Riêng các block thuần ảnh (không có line text) tự khắc bị bỏ qua vì rỗng.
 SKIP_BLOCK_TYPES: set[BlockType] = set()
+
+# Bug 4: Pattern quét NHIỀU đáp án inline trong cùng 1 dòng OCR
+# vd: "A. x=1  B. x=2  C. x=3  D. x=4" → 4 answer anchor
+ANSWER_INLINE_RE = re.compile(r"(?:^|\s)([A-D])\s*[\.\)]\s*")
 
 
 def strip_accents(text: str) -> str:
@@ -111,6 +117,53 @@ def _match_line(text: str, normalized_text: str) -> list[tuple[AnchorType, str |
     return []
 
 
+def _extract_inline_answers(
+    line: TextLine, page_index: int, normalized: str,
+) -> list[Anchor]:
+    """Bug 4: Quét NHIỀU đáp án inline trong cùng 1 dòng OCR.
+
+    Khi 1 line chứa "A. x=1  B. x=2  C. x=3  D. x=4", _match_line chỉ
+    trả về anchor A (do ^). Hàm này dùng finditer tìm thêm B/C/D.
+    Bbox mỗi đáp án ước lượng theo tỉ lệ ký tự trong line.
+    """
+    matches = list(ANSWER_INLINE_RE.finditer(normalized))
+    if len(matches) <= 1:
+        return []  # chỉ có 1 hoặc 0 → _match_line đã xử lý
+
+    results: list[Anchor] = []
+    line_x1, line_y1, line_x2, line_y2 = line.bbox
+    line_w = line_x2 - line_x1
+    text_len = max(len(normalized), 1)
+
+    for i, m in enumerate(matches):
+        label = m.group(1)
+        # Ước lượng bbox theo vị trí ký tự
+        char_start = m.start()
+        if i + 1 < len(matches):
+            char_end = matches[i + 1].start()
+        else:
+            char_end = text_len
+        frac_start = char_start / text_len
+        frac_end = char_end / text_len
+        est_x1 = line_x1 + frac_start * line_w
+        est_x2 = line_x1 + frac_end * line_w
+
+        # Text đáp án = substring từ match hiện tại đến match kế
+        ans_text = normalized[m.start():char_end].strip()
+
+        results.append(Anchor(
+            page_index=page_index,
+            type=AnchorType.ANSWER,
+            bbox=(est_x1, line_y1, est_x2, line_y2),
+            text=ans_text,
+            value=label,
+            confidence=line.confidence,
+            source="regex_inline",
+        ))
+
+    return results
+
+
 def extract_anchors(blocks_per_page: list[list[Block]]) -> list[Anchor]:
     """Extract anchors từ tất cả blocks per page.
 
@@ -133,16 +186,33 @@ def extract_anchors(blocks_per_page: list[list[Block]]) -> list[Anchor]:
                 normalized = strip_accents(text).strip()
 
                 matches = _match_line(text, normalized)
-                for anchor_type, value, matched_text in matches:
-                    anchors.append(Anchor(
-                        page_index=block.page_index,
-                        type=anchor_type,
-                        bbox=line.bbox,
-                        text=matched_text,
-                        value=value,
-                        confidence=line.confidence,
-                        source="regex",
-                    ))
+                if matches:
+                    anchor_type, value, matched_text = matches[0]
+                    if anchor_type == AnchorType.ANSWER:
+                        # Bug 4: Check đáp án inline (nhiều đáp án cùng 1 line)
+                        inline = _extract_inline_answers(line, block.page_index, normalized)
+                        if inline:
+                            anchors.extend(inline)
+                        else:
+                            anchors.append(Anchor(
+                                page_index=block.page_index,
+                                type=anchor_type,
+                                bbox=line.bbox,
+                                text=matched_text,
+                                value=value,
+                                confidence=line.confidence,
+                                source="regex",
+                            ))
+                    else:
+                        anchors.append(Anchor(
+                            page_index=block.page_index,
+                            type=anchor_type,
+                            bbox=line.bbox,
+                            text=matched_text,
+                            value=value,
+                            confidence=line.confidence,
+                            source="regex",
+                        ))
 
     logger.info(f"Extracted {len(anchors)} anchors total")
     _log_anchor_stats(anchors)

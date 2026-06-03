@@ -6,6 +6,44 @@ Format: `[Phase X.Y] - YYYY-MM-DD - Title`
 
 ---
 
+## [Phase 2.4] - 2026-06-03 - Fix line-granularity + answer regex + clip đáp án + inline answers
+
+### Mục đích
+Fix 4 bug gốc rễ phát hiện khi test Phase 2 trên `demau_toan8.pdf`. Bugs khiến: câu nuốt cả trang, mất đáp án B/C, đáp án lẹm sang câu sau, đáp án ngang 1 dòng chỉ bắt được 1.
+
+### Bug 1 🔴 (CRITICAL) — Snake Walker gom theo BLOCK thay vì LINE
+**Nguyên nhân:** `snake_walker.py` dùng `block.bbox` để gom — nhưng layout model `en` gom cả trang 2 thành 1 block `figure` (bbox y=46→3273). Kết quả: q5 nuốt cả trang, q6/q7 chỉ còn 66px.
+**Fix:** Thêm `PositionedLine` dataclass + `_flatten_lines()`. Chuyển toàn bộ snake_walk sang LINE granularity: gom, tính bbox, split content/answer đều dùng `line.bbox` thay `block.bbox`.
+**Kết quả:** q5 chỉ ôm các dòng phương trình thật, q6/q7 có đủ nội dung.
+
+### Bug 2 🔴 — Regex đáp án mất B/C (dính liền OCR)
+**Nguyên nhân:** Pattern `\s+\S` (≥1 space sau dấu chấm). OCR cho "B.m =4" → trượt.
+**Fix:** Đổi `\s+` → `\s*` trong ANSWER + SUB_QUESTION pattern.
+**Kết quả:** toan8 Câu 1-4 ra đủ 4 đáp án (trước: 2,2,3,4).
+
+### Bug 3 🔴 — Đáp án cuối lẹm sang câu sau
+**Nguyên nhân:** Vùng đáp án cuối kéo tới `end` (anchor câu kế). Phân số câu sau render trước dòng "Câu N" → lọt vào.
+**Fix:** `_clip_last_answer_lines()` — chỉ giữ line cùng hàng hoặc sát dưới dòng đáp án (≤ 1.5x line_height).
+**Kết quả:** q3_D chỉ chứa "D. m=3", không kèm Câu 4.
+
+### Bug 4 🟡 — 4 đáp án chung 1 dòng OCR
+**Nguyên nhân:** OCR trả "A. x B. y C. z D. w" là 1 line → `^` match chỉ A.
+**Fix:** Thêm `ANSWER_INLINE_RE` + `_extract_inline_answers()` trong anchor_extractor: dùng `re.finditer` quét nhiều đáp án, chia bbox theo tỉ lệ ký tự.
+**Kết quả:** Câu có đáp án ngang 1 dòng ra đủ 4 anchor (source="regex_inline").
+
+### Đã sửa
+- **`src/services/snake_walker.py`** — rewrite: thêm `PositionedLine`, `_flatten_lines()`, `_compute_multi_region_from_lines()`, `_clip_last_answer_lines()`. Bỏ hàm `_gpos_of_block`, `_compute_multi_region` cũ.
+- **`src/services/anchor_extractor.py`** — regex `\s*`, thêm `ANSWER_INLINE_RE`, `_extract_inline_answers()`, refactor `extract_anchors()`.
+- **`tests/test_phase2.py`** — thêm 2 test: `test_flatten_lines`, `test_snake_walk_line_granularity`, `test_clip_last_answer`.
+
+### Trade-off
+- ✅ Line bbox luôn chính xác dù layout model sai → pipeline robust hơn.
+- ✅ has_figure chỉ set khi line rỗng text thuộc block figure (tránh dương tính giả).
+- ⚠️ Inline answer bbox ước lượng theo tỉ lệ ký tự (không pixel-perfect), đủ để crop.
+- ⚠️ _clip_last_answer_lines dùng heuristic 1.5x line_height — có thể cần tune.
+
+---
+
 ## [Phase 2.3] - 2026-06-03 - Cropper + Debug Overlay + CLI tích hợp
 
 ### Mục đích
