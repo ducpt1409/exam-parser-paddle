@@ -6,6 +6,41 @@ Format: `[Phase X.Y] - YYYY-MM-DD - Title`
 
 ---
 
+## [Phase 2.9] - 2026-06-04 - Ranh giới content/đáp án theo answer-block-top (phân số)
+
+### Mục đích
+Đề azota: nhiều câu "content cắt xuống đáp án" và "đáp án mất tử số phân số". Xử lý ở
+tầng region (an toàn cho toan8/tienganh).
+
+### Nguyên nhân
+Ranh giới content/đáp án dựa vào y_top của MARKER đáp án ("A."). Nhưng TỬ SỐ phân số
+(vd "√3+√2", "2a³") nằm PHÍA TRÊN dòng marker → lọt vào content (content cắt xuống) và
+đáp án bị mất tử số.
+
+### Giải pháp (`snake_walker.py`)
+- `answer_block_top = (trang, min(marker y_top) − 1 chiều-cao-marker)` — nới ranh giới
+  LÊN ~1 dòng để bao tử số phân số (không áp dụng cho câu đáp-án-inline-trên-dòng-hỏi).
+- Content = lines trên `answer_block_top`; `_clip_bottom_to()` clip mép dưới content
+  ≤ answer_block_top → KHÔNG cắt xuống đáp án.
+- Zone đáp án bắt đầu từ `answer_block_top` → tử số phân số vào vùng đáp án (nearest-anchor
+  gộp tử số + marker + mẫu số → đáp án trọn phân số).
+
+### Kết quả (verify simulation 3 đề)
+| Đề | content_bot vs marker_top |
+|---|---|
+| AZOTA q1,2,4,5,12,13,14,15 | đều ≤ marker_top (hết cắt xuống đáp án) ✅ |
+| TOAN8 q1-4 | content_bot ≪ marker (không regression) ✅ |
+| TIENGANH q1,13,23 | OK (không regression) ✅ |
+
+### Còn lại (PHẠM VI SAU — trần OCR, cần VLM Phase 3)
+Đề azota toán-dày: PaddleOCR **đọc sai/mất hẳn** nhiều công thức:
+- q1 chỉ ra "B." "D." (bare), A & C MẤT HẲN; q7 không ra đáp án nào; q2/q12/q13/q14 thiếu 1 đáp án.
+- Đồ thị (q3) crop chưa chuẩn (vùng figure).
+→ Không có tín hiệu để recover bằng rule. Đã flag needs_review. VLM (Qwen3-VL) Phase 3 đọc
+  trực tiếp vùng ảnh sẽ xử lý các trường hợp này.
+
+---
+
 ## [Phase 2.8] - 2026-06-03 - Recover câu OCR mất marker + bare answer marker (đề azota)
 
 ### Mục đích

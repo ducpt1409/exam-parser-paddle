@@ -171,6 +171,22 @@ def _extend_right_to(region: MultiRegion, ref: MultiRegion) -> MultiRegion:
     return MultiRegion(parts=new_parts)
 
 
+def _clip_bottom_to(region: MultiRegion, limit: tuple[int, float]) -> MultiRegion:
+    """Clip mép dưới (y2) của region trên trang `limit[0]` xuống tối đa `limit[1]`.
+
+    Dùng cho content: không để mép dưới content lấn xuống vùng đáp án.
+    """
+    lp, ly = limit
+    new_parts = []
+    for p in region.parts:
+        x1, y1, x2, y2 = p.bbox
+        if p.page_index == lp and y2 > ly:
+            y2 = max(y1 + 1, ly)
+        if y2 > y1:
+            new_parts.append(Region(page_index=p.page_index, bbox=(x1, y1, x2, y2)))
+    return MultiRegion(parts=new_parts) if new_parts else region
+
+
 def _classify_group_type(header_text: str) -> GroupType:
     """Phân loại GroupType từ text header (strip dấu, lowercase). Theo §3.5."""
     norm = _strip_accents(header_text).lower().strip()
@@ -695,6 +711,18 @@ def snake_walk(
             and abs(a.bbox[1] - q_anchor.bbox[1]) < 8
         ]
 
+        # Ranh giới content/đáp án: NỚI LÊN ~1 dòng marker so với marker đầu tiên để bao
+        # TỬ SỐ phân số (tử số nằm phía trên dòng marker đáp án). Nếu không, tử số lọt vào
+        # content (content cắt xuống đáp án) và đáp án bị mất tử số. Không áp dụng cho câu
+        # đáp án-inline-trên-dòng-hỏi (không có tử số phía trên).
+        answer_block_top = first_answer_pos
+        if q_answers_anchors and not q_line_inline:
+            ans_top = min(a.bbox[1] for a in q_answers_anchors)
+            _h = sorted(a.bbox[3] - a.bbox[1] for a in q_answers_anchors)
+            band = _h[len(_h) // 2] if _h else 50.0
+            top_page = min(_gpos_of_anchor(a) for a in q_answers_anchors)[0]
+            answer_block_top = (top_page, ans_top - band)
+
         # --- Content region ---
         pidx0 = q_anchor.page_index
         pw0 = page_widths[pidx0] if pidx0 < len(page_widths) else 2550
@@ -716,17 +744,19 @@ def snake_walk(
                 parts = ar.parts + parts
             content_region = MultiRegion(parts=parts)
             content_text = q_anchor.text.strip()
-        elif first_answer_pos:
+        elif answer_block_top:
             content_lines = [
                 ln for ln in q_lines
-                if _gpos_of_line(ln) < first_answer_pos
+                if _gpos_of_line(ln) < answer_block_top
             ]
             content_region = _compute_multi_region_from_lines(
-                content_lines, start, first_answer_pos, page_heights, page_widths
+                content_lines, start, answer_block_top, page_heights, page_widths
             )
             content_text = " ".join(
                 ln.text.strip() for ln in content_lines if ln.text.strip()
             )
+            # Clip mép dưới content KHÔNG vượt quá answer_block_top (không cắt xuống đáp án)
+            content_region = _clip_bottom_to(content_region, answer_block_top)
             # Mở rộng mép phải content = mép phải full region để bắt blank "____" cuối
             # câu mà OCR bỏ sót (vd "dreams of having ______" → OCR dừng ở "having").
             content_region = _extend_right_to(content_region, full_region)
@@ -748,10 +778,10 @@ def snake_walk(
             _seen_lbl.add(lbl)
             uniq_anchors.append(a_anchor)
 
-        # Các line thuộc vùng đáp án (từ đáp án đầu trở đi)
+        # Các line thuộc vùng đáp án (từ answer_block_top trở đi — gồm cả tử số phân số)
         zone_lines = [
             ln for ln in q_lines
-            if first_answer_pos is not None and _gpos_of_line(ln) >= first_answer_pos
+            if answer_block_top is not None and _gpos_of_line(ln) >= answer_block_top
         ]
         # Loại line nằm DƯỚI XA hàng đáp án cuối (vd group header "Phần II"
         # chen giữa câu này và câu sau) — tránh kéo dài vùng đáp án xuống.
