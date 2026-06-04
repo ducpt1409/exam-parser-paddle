@@ -418,6 +418,70 @@ def _find_content_end(
     return None
 
 
+def _recover_missing_anchors(
+    q_anchors: list[Anchor],
+    answer_anchors: list[Anchor],
+    page_widths: list[float],
+) -> list[Anchor]:
+    """Phục hồi câu hỏi bị OCR MẤT dòng "Câu N:" (gap số câu).
+
+    Dấu hiệu: số câu nhảy (33 → 35) NHƯNG vùng giữa có thêm chu kỳ đáp án A-D
+    (đáp án của câu bị mất). Tạo anchor tổng hợp (source="recovered") đặt ngay
+    trên chu kỳ đáp án đó → Snake Walker tách thành câu riêng (cần review).
+    """
+    q_sorted = sorted(
+        [a for a in q_anchors if a.number is not None], key=_gpos_of_anchor
+    )
+    recovered: list[Anchor] = []
+
+    for i in range(len(q_sorted) - 1):
+        n1, n2 = q_sorted[i].number, q_sorted[i + 1].number
+        if n2 <= n1 + 1:
+            continue
+        start = _gpos_of_anchor(q_sorted[i])
+        end = _gpos_of_anchor(q_sorted[i + 1])
+        gap_ans = sorted(
+            [a for a in answer_anchors if start < _gpos_of_anchor(a) < end],
+            key=_gpos_of_anchor,
+        )
+        # Tách chu kỳ đáp án (label lặp lại → chu kỳ mới)
+        cycles: list[list[Anchor]] = []
+        cur: list[Anchor] = []
+        seen: set[str] = set()
+        for a in gap_ans:
+            lbl = a.value or ""
+            if lbl in seen and cur:
+                cycles.append(cur)
+                cur, seen = [], set()
+            cur.append(a)
+            seen.add(lbl)
+        if cur:
+            cycles.append(cur)
+
+        # cycles[0] = đáp án câu n1 (đã có anchor). cycles[1:] = câu bị mất.
+        for j, mnum in enumerate(range(n1 + 1, n2)):
+            ci = j + 1
+            if ci >= len(cycles):
+                break
+            cyc = cycles[ci]
+            page = cyc[0].page_index
+            prev_same = [a.bbox[3] for a in cycles[ci - 1] if a.page_index == page]
+            cyc_top = min(a.bbox[1] for a in cyc)
+            prev_bottom = max(prev_same) if prev_same else cyc_top - 80
+            syn_y = min(prev_bottom + 5, cyc_top - 5)
+            pw = page_widths[page] if page < len(page_widths) else 2550
+            recovered.append(Anchor(
+                page_index=page,
+                type=AnchorType.QUESTION,
+                bbox=(80.0, syn_y, min(400.0, pw), syn_y + 40.0),
+                text=f"Câu {mnum}",
+                value=str(mnum),
+                confidence=0.4,
+                source="recovered",
+            ))
+    return recovered
+
+
 # ============================================================
 # MAIN: snake_walk
 # ============================================================
@@ -476,6 +540,12 @@ def snake_walk(
         [a for a in anchors if a.type == AnchorType.GROUP_HEADER],
         key=_gpos_of_anchor,
     )
+
+    # Recover câu hỏi bị OCR mất dòng "Câu N:" (gap số câu + chu kỳ đáp án dư)
+    recovered = _recover_missing_anchors(q_anchors, answer_anchors, page_widths)
+    if recovered:
+        logger.info(f"Recover {len(recovered)} câu OCR mất marker: {[a.value for a in recovered]}")
+        q_anchors = sorted(q_anchors + recovered, key=_gpos_of_anchor)
 
     logger.info(
         f"Snake Walker input: {len(q_anchors)} câu, {len(answer_anchors)} đáp án, "
@@ -597,6 +667,10 @@ def snake_walk(
 
         # Đáp án tách từ inline (dính dòng / dàn hàng) → bbox ước lượng → cần review
         if any(a.source == "regex_inline" for a in q_answers_anchors):
+            needs_review = True
+
+        # MCQ thiếu đáp án: có 1-3 đáp án (chuẩn là 4) → OCR có thể sót → cần review
+        if 1 <= len(answers) <= 3:
             needs_review = True
 
         # ================================================================
@@ -732,6 +806,18 @@ def snake_walk(
         for a in q_answers_anchors:
             related_confidences.append(a.confidence)
         confidence = min(related_confidences)
+
+        # --- Câu RECOVERED (OCR mất marker): full = băng full-width [start,end] để
+        #     crop được cả phần stem mà OCR bỏ sót; bắt buộc review ---
+        if q_anchor.source == "recovered":
+            needs_review = True
+            pidx = q_anchor.page_index
+            pw = page_widths[pidx] if pidx < len(page_widths) else 2550
+            ph = page_heights[pidx] if pidx < len(page_heights) else 3300
+            end_y = end[1] if end[0] == pidx else ph
+            band = _pad_bbox((0, start[1], pw, min(end_y, ph)), pw, ph)
+            full_region = MultiRegion(parts=[Region(page_index=pidx, bbox=band)])
+            content_region = full_region
 
         # ================================================================
         # Bước 5 — Tạo Question

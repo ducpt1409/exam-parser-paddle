@@ -35,9 +35,11 @@ ANCHOR_PATTERNS: dict[AnchorType, list[tuple[Pattern, int | None]]] = {
     ],
     AnchorType.ANSWER: [
         # "A.", "B.", "C.", "D." ở đầu dòng - đáp án trắc nghiệm
-        # Bug 2 fix: \s+ → \s* (cho phép 0 khoảng trắng, vd OCR "B.m =4")
-        # Fix dấu phẩy: OCR hay đọc "B." thành "B," → chấp nhận [\.\),]
-        (re.compile(r"^\s*([A-D])\s*[\.\),]\s*\S"), 1),
+        # - \s* (0 khoảng trắng): OCR "B.m =4"
+        # - [\.\),]: OCR hay đọc "B." thành "B," / "B)"
+        # - KHÔNG đòi ký tự sau dấu: đề toán OCR hay tách bare marker "A." riêng,
+        #   nội dung (công thức) nằm ở fragment khác → vẫn phải bắt được marker.
+        (re.compile(r"^\s*([A-D])\s*[\.\),]\s*"), 1),
     ],
     AnchorType.SUB_QUESTION: [
         # "a)", "b)", "c)", "d)" - đúng/sai

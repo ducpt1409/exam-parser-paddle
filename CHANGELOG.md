@@ -6,6 +6,44 @@ Format: `[Phase X.Y] - YYYY-MM-DD - Title`
 
 ---
 
+## [Phase 2.8] - 2026-06-03 - Recover câu OCR mất marker + bare answer marker (đề azota)
+
+### Mục đích
+Đề azota (toán THPT, 23 trang, đầy công thức) detect thiếu câu & đáp án. Xử lý.
+
+### Vấn đề & nguyên nhân (verify trên d53bc224)
+1. **Thiếu câu 34, 43, 46**: OCR MẤT HẲN dòng "Câu N:" (chỉ còn đáp án + dòng nội dung
+   tiếp). Câu trước (33/42/45) có `end` = câu kế (35/44/47) → nuốt luôn câu bị mất.
+2. **Đáp án thiếu (nhiều câu 0-3 đáp án)**: công thức toán bị OCR tách rời → marker
+   đáp án thành "bare marker" ("A." / "B." không có nội dung ngay sau) → regex đòi `\S` → trượt.
+
+### Giải pháp
+**`anchor_extractor.py`** — regex đáp án bỏ yêu cầu `\S` sau dấu: `^\s*([A-D])\s*[\.\),]\s*`
+→ bắt được bare marker "A." (nội dung công thức ở fragment khác, gộp qua nearest-anchor).
+
+**`snake_walker.py`**
+- `_recover_missing_anchors()`: phát hiện gap số câu (33→35) + chu kỳ đáp án A-D dư trong
+  vùng giữa → tạo anchor tổng hợp (source="recovered") cho câu bị mất.
+- Câu recovered: full region = băng full-width [start,end] (crop được cả stem OCR bỏ sót),
+  bắt buộc needs_review.
+- MCQ có 1-3 đáp án (chuẩn 4) → needs_review (OCR có thể sót đáp án).
+
+### Kết quả (verify qua simulation trên blocks.json)
+| | Trước | Sau |
+|---|---|---|
+| Câu trích | 47 (thiếu 34,43,46) | **50** (recover 34,43,46) ✅ |
+| Đáp án 0 | 4 câu | 1 câu ✅ |
+| Đáp án đủ 4 | 30 câu | 32 câu ✅ |
+| Câu <4 đáp án | (lẫn lộn) | đều set needs_review để soát ✅ |
+
+### Còn lại (PHẠM VI SAU — giới hạn OCR, cần VLM Phase 3)
+- ~18 câu vẫn <4 đáp án: công thức toán bị OCR phân mảnh nặng / marker đáp án mất hẳn
+  (không có tín hiệu để recover). Đã flag needs_review.
+- Vùng câu recovered là băng full-width ước lượng → review thủ công.
+- Đề toán phức tạp (đồ thị, phân số nhiều tầng) → độ chính xác phụ thuộc OCR; VLM sẽ cải thiện.
+
+---
+
 ## [Phase 2.7] - 2026-06-03 - Crop chính xác đáp án inline + blank cuối câu + tên group
 
 ### Mục đích
