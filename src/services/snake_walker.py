@@ -156,6 +156,21 @@ def _merge_bboxes(bboxes: list[BBox]) -> BBox:
     return (x1, y1, x2, y2)
 
 
+def _extend_right_to(region: MultiRegion, ref: MultiRegion) -> MultiRegion:
+    """Mở rộng mép phải (x2) của region cho bằng ref trên cùng trang.
+
+    Dùng để content bắt trọn blank "____" cuối câu mà OCR bỏ sót (mép phải
+    content thường ngắn hơn full region vì OCR không đọc gạch dưới).
+    """
+    ref_x2 = {p.page_index: p.bbox[2] for p in ref.parts}
+    new_parts = []
+    for p in region.parts:
+        rx2 = ref_x2.get(p.page_index, p.bbox[2])
+        x1, y1, x2, y2 = p.bbox
+        new_parts.append(Region(page_index=p.page_index, bbox=(x1, y1, max(x2, rx2), y2)))
+    return MultiRegion(parts=new_parts)
+
+
 def _classify_group_type(header_text: str) -> GroupType:
     """Phân loại GroupType từ text header (strip dấu, lowercase). Theo §3.5."""
     norm = _strip_accents(header_text).lower().strip()
@@ -598,8 +613,36 @@ def snake_walk(
             q_lines, start, end, page_heights, page_widths
         )
 
+        # Đáp án inline nằm TRÊN chính dòng câu hỏi? ("Question 27: A. answer B. ...")
+        q_line_inline = [
+            a for a in q_answers_anchors
+            if a.source == "regex_inline"
+            and a.page_index == q_anchor.page_index
+            and abs(a.bbox[1] - q_anchor.bbox[1]) < 8
+        ]
+
         # --- Content region ---
-        if first_answer_pos:
+        pidx0 = q_anchor.page_index
+        pw0 = page_widths[pidx0] if pidx0 < len(page_widths) else 2550
+        ph0 = page_heights[pidx0] if pidx0 < len(page_heights) else 3300
+
+        if q_line_inline:
+            # Câu kiểu "Question N: A. .. B. ..": content = phần stem TRƯỚC đáp án inline
+            # đầu tiên (chỉ "Question N:"), KHÔNG kèm cả dòng đáp án.
+            stem_x2 = min(a.bbox[0] for a in q_line_inline)
+            qb = q_anchor.bbox
+            cb = _pad_bbox((qb[0], qb[1], max(stem_x2, qb[0] + 10), qb[3]), pw0, ph0)
+            parts = [Region(page_index=pidx0, bbox=cb)]
+            # Nếu stem có dòng phía trên (hiếm) → thêm vào
+            above = [ln for ln in q_lines if _gpos_of_line(ln) < (pidx0, qb[1])]
+            if above:
+                ar = _compute_multi_region_from_lines(
+                    above, start, (pidx0, qb[1]), page_heights, page_widths
+                )
+                parts = ar.parts + parts
+            content_region = MultiRegion(parts=parts)
+            content_text = q_anchor.text.strip()
+        elif first_answer_pos:
             content_lines = [
                 ln for ln in q_lines
                 if _gpos_of_line(ln) < first_answer_pos
@@ -610,6 +653,9 @@ def snake_walk(
             content_text = " ".join(
                 ln.text.strip() for ln in content_lines if ln.text.strip()
             )
+            # Mở rộng mép phải content = mép phải full region để bắt blank "____" cuối
+            # câu mà OCR bỏ sót (vd "dreams of having ______" → OCR dừng ở "having").
+            content_region = _extend_right_to(content_region, full_region)
         else:
             content_region = full_region
             content_text = " ".join(content_parts)
@@ -640,24 +686,34 @@ def snake_walk(
             _hs = sorted(a.bbox[3] - a.bbox[1] for a in uniq_anchors)
             line_h = _hs[len(_hs) // 2] if _hs else 50.0
             zone_lines = [ln for ln in zone_lines if ln.bbox[1] <= ans_bottom + 1.2 * line_h]
+        # Loại chính DÒNG CÂU HỎI khỏi zone — đáp án inline trên đó ("Question 27: A..")
+        # dùng bbox ước lượng riêng, không gộp cả dòng vào đáp án A.
+        zone_lines = [
+            ln for ln in zone_lines
+            if not (ln.page_index == q_anchor.page_index
+                    and abs(ln.bbox[1] - q_anchor.bbox[1]) < 8
+                    and ln.bbox[0] <= q_anchor.bbox[2])
+        ]
 
         def _center(bb: BBox) -> tuple[float, float]:
             return ((bb[0] + bb[2]) / 2.0, (bb[1] + bb[3]) / 2.0)
 
         # Bucket bbox cho mỗi anchor (khởi tạo = bbox anchor)
         buckets: dict[int, list[BBox]] = {k: [a.bbox] for k, a in enumerate(uniq_anchors)}
+        # CHỈ gán zone line vào đáp án KHÔNG phải inline (đáp án inline giữ nguyên bbox
+        # ước lượng — gộp dòng sẽ phình ra cả "Question N:").
+        nonline_ks = [k for k, a in enumerate(uniq_anchors) if a.source != "regex_inline"]
         for ln in zone_lines:
+            if not nonline_ks:
+                break
             lcx, lcy = _center(ln.bbox)
-            best_k, best_d = None, float("inf")
-            for k, a in enumerate(uniq_anchors):
-                acx, acy = _center(a.bbox)
-                # phạt khác trang để ưu tiên cùng trang
-                page_pen = 0.0 if a.page_index == ln.page_index else 1e6
-                d = ((lcx - acx) ** 2 + (lcy - acy) ** 2) ** 0.5 + page_pen
-                if d < best_d:
-                    best_d, best_k = d, k
-            if best_k is not None:
-                buckets[best_k].append(ln.bbox)
+            best_k = min(
+                nonline_ks,
+                key=lambda k: ((lcx - _center(uniq_anchors[k].bbox)[0]) ** 2
+                               + (lcy - _center(uniq_anchors[k].bbox)[1]) ** 2) ** 0.5
+                + (0.0 if uniq_anchors[k].page_index == ln.page_index else 1e6),
+            )
+            buckets[best_k].append(ln.bbox)
 
         answer_regions: list[tuple[str, MultiRegion]] = []
         for k, a_anchor in enumerate(uniq_anchors):

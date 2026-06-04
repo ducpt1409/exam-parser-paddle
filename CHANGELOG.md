@@ -6,6 +6,49 @@ Format: `[Phase X.Y] - YYYY-MM-DD - Title`
 
 ---
 
+## [Phase 2.7] - 2026-06-03 - Crop chính xác đáp án inline + blank cuối câu + tên group
+
+### Mục đích
+Sau 2.6 (đề Anh đã đủ đáp án), tinh chỉnh CHẤT LƯỢNG vùng crop theo phản hồi:
+content/đáp án câu dạng "Question N: A.. B.." còn dính nhau; blank "____" cuối câu bị mất.
+
+### Vấn đề & nguyên nhân (verify trên 833c8435)
+1. **q4/q5/q27/q28**: content crop cả dòng (kèm A,B,C,D); đáp án A kèm "Question N".
+   Nguyên nhân: gán nearest-anchor GỘP cả dòng câu hỏi vào bucket A → A phình lại; content
+   không có line riêng (đáp án inline cùng y) → fallback full-width.
+2. **q24**: blank "____" cuối câu ("dreams of having ___") mất — OCR không đọc gạch dưới
+   → dòng kết thúc ở "having", content cắt tại đó.
+3. Yêu cầu: tên file group kèm dải số câu để kiểm tra group đúng/sai.
+
+### Giải pháp (`snake_walker.py` + `cropper.py`)
+1. **Đáp án inline** (`source=regex_inline`): dùng bbox ƯỚC LƯỢNG riêng, KHÔNG gộp line.
+   - Loại chính dòng câu hỏi khỏi zone đáp án.
+   - Chỉ gán zone line vào đáp án non-inline (đáp án tách dòng).
+2. **Content khi có đáp án inline trên dòng câu hỏi**: content = phần stem TRƯỚC đáp án
+   inline đầu tiên ("Question 27:" thôi).
+3. **`_extend_right_to()`**: content thường mở rộng mép phải = mép phải full region
+   → bắt trọn blank "____" cuối câu OCR bỏ sót.
+4. **Tên file group**: `g{k}_header_{min}_{max}.png` (vd `g1_header_1_3.png`) — dải số câu.
+
+### Kết quả (verify qua simulation)
+| | Trước | Sau |
+|---|---|---|
+| q27 content | [0,2550] full | [154,419] "Question 27:" ✅ |
+| q27 đáp án A | [146,647] kèm Question | [419,639] "A. answer" ✅ |
+| q4/q28 | A dính Question | content + A tách riêng ✅ |
+| q24 blank | cắt x1152 | mở rộng x1899 (bắt blank) ✅ |
+| tên group | g1_header.png | g1_header_1_3.png ✅ |
+
+### Còn lại (PHẠM VI SAU)
+- bbox đáp án inline là ƯỚC LƯỢNG theo tỉ lệ ký tự (đã set needs_review) → muốn pixel-chuẩn
+  cần OCR-lại vùng hoặc VLM Phase 3.
+- Blank dài VƯỢT mép phải answer column (hiếm) có thể vẫn thiếu chút → cần image-scan gạch dưới.
+
+### Cần làm
+Chạy lại `parse_cli.py` đề tienganh trên WSL, kiểm tra crops/ (q4,5,24,27,28) + tên g*_header_*.
+
+---
+
 ## [Phase 2.6] - 2026-06-03 - Fix azota 0-crop + đáp án dính dòng + group leak
 
 ### Mục đích

@@ -189,13 +189,17 @@ def crop_group_lead(
     images: list[Image.Image],
     out_dir: Path,
     group_id: str,
+    q_range: str = "",
 ) -> Optional[CroppedImage]:
-    """Crop ảnh đoạn dẫn (header + passage) cho 1 group."""
+    """Crop ảnh đoạn dẫn (header + passage) cho 1 group.
+
+    q_range: hậu tố dải số câu để dễ kiểm tra group, vd "1_3" → g1_header_1_3.png.
+    """
     crops_dir = out_dir / "crops"
-    path = crops_dir / f"{group_id}_header.png"
-    return _make_cropped_image(
-        mregion, images, path, f"crops/{group_id}_header.png"
-    )
+    suffix = f"_{q_range}" if q_range else ""
+    name = f"{group_id}_header{suffix}.png"
+    path = crops_dir / name
+    return _make_cropped_image(mregion, images, path, f"crops/{name}")
 
 
 # ============================================================
@@ -332,11 +336,15 @@ def crop_all(
             q.needs_review = True
 
     # Crop group lead-in (header + passage)
+    # Map q_id → số câu để tính dải [min..max] đưa vào tên file (dễ kiểm tra group).
+    qnum_by_id = {q.id: q.number for q in exam.questions}
     for g in exam.groups:
         if g.id in group_layouts:
+            nums = sorted(qnum_by_id[qid] for qid in g.question_ids if qid in qnum_by_id)
+            q_range = f"{nums[0]}_{nums[-1]}" if nums else ""
             try:
                 lead_img = crop_group_lead(
-                    group_layouts[g.id], images, out_dir, g.id
+                    group_layouts[g.id], images, out_dir, g.id, q_range
                 )
                 g.header_image = lead_img
                 if g.passage_text:  # PASSAGE → đoạn dẫn cũng là passage
