@@ -184,17 +184,17 @@ def crop_question(
     return full_image, content_image, updated_answers
 
 
-def crop_group_passage(
+def crop_group_lead(
     mregion: MultiRegion,
     images: list[Image.Image],
     out_dir: Path,
     group_id: str,
 ) -> Optional[CroppedImage]:
-    """Crop ảnh passage cho 1 group."""
+    """Crop ảnh đoạn dẫn (header + passage) cho 1 group."""
     crops_dir = out_dir / "crops"
-    path = crops_dir / f"{group_id}_passage.png"
+    path = crops_dir / f"{group_id}_header.png"
     return _make_cropped_image(
-        mregion, images, path, f"crops/{group_id}_passage.png"
+        mregion, images, path, f"crops/{group_id}_header.png"
     )
 
 
@@ -331,16 +331,18 @@ def crop_all(
             logger.error(f"Câu {q.number}: lỗi crop — {e}")
             q.needs_review = True
 
-    # Crop group passages
+    # Crop group lead-in (header + passage)
     for g in exam.groups:
         if g.id in group_layouts:
             try:
-                passage_img = crop_group_passage(
+                lead_img = crop_group_lead(
                     group_layouts[g.id], images, out_dir, g.id
                 )
-                g.passage_image = passage_img
+                g.header_image = lead_img
+                if g.passage_text:  # PASSAGE → đoạn dẫn cũng là passage
+                    g.passage_image = lead_img
             except Exception as e:
-                logger.error(f"Group {g.id}: lỗi crop passage — {e}")
+                logger.error(f"Group {g.id}: lỗi crop lead-in — {e}")
 
     # Vẽ debug overlay
     try:

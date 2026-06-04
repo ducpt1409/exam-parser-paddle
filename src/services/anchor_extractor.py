@@ -36,7 +36,8 @@ ANCHOR_PATTERNS: dict[AnchorType, list[tuple[Pattern, int | None]]] = {
     AnchorType.ANSWER: [
         # "A.", "B.", "C.", "D." ở đầu dòng - đáp án trắc nghiệm
         # Bug 2 fix: \s+ → \s* (cho phép 0 khoảng trắng, vd OCR "B.m =4")
-        (re.compile(r"^\s*([A-D])\s*[\.\)]\s*\S"), 1),
+        # Fix dấu phẩy: OCR hay đọc "B." thành "B," → chấp nhận [\.\),]
+        (re.compile(r"^\s*([A-D])\s*[\.\),]\s*\S"), 1),
     ],
     AnchorType.SUB_QUESTION: [
         # "a)", "b)", "c)", "d)" - đúng/sai
@@ -77,7 +78,8 @@ SKIP_BLOCK_TYPES: set[BlockType] = set()
 
 # Bug 4: Pattern quét NHIỀU đáp án inline trong cùng 1 dòng OCR
 # vd: "A. x=1  B. x=2  C. x=3  D. x=4" → 4 answer anchor
-ANSWER_INLINE_RE = re.compile(r"(?:^|\s)([A-D])\s*[\.\)]\s*")
+# Chấp nhận cả dấu phẩy (OCR "B," ) như regex đáp án chính.
+ANSWER_INLINE_RE = re.compile(r"(?:^|\s)([A-D])\s*[\.\),]\s*")
 
 
 def strip_accents(text: str) -> str:
@@ -119,16 +121,20 @@ def _match_line(text: str, normalized_text: str) -> list[tuple[AnchorType, str |
 
 def _extract_inline_answers(
     line: TextLine, page_index: int, normalized: str,
+    start: int = 0, min_count: int = 2,
 ) -> list[Anchor]:
-    """Bug 4: Quét NHIỀU đáp án inline trong cùng 1 dòng OCR.
+    """Quét đáp án inline trong cùng 1 dòng OCR (Bug 4 + đáp án dính dòng Question).
 
-    Khi 1 line chứa "A. x=1  B. x=2  C. x=3  D. x=4", _match_line chỉ
-    trả về anchor A (do ^). Hàm này dùng finditer tìm thêm B/C/D.
-    Bbox mỗi đáp án ước lượng theo tỉ lệ ký tự trong line.
+    - Đáp án dàn hàng ngang: "A. x=1  B. x=2  C. x=3  D. x=4" (min_count=2).
+    - Đáp án dính dòng câu hỏi: "Question 4: A. liberty" (start = sau marker câu,
+      min_count=1 → bắt đáp án A bị nuốt vào dòng "Question N:").
+
+    Bbox mỗi đáp án ước lượng theo tỉ lệ ký tự trong line (chưa chính xác bằng
+    OCR thật → các anchor này nên gắn cờ needs_review ở tầng sau).
     """
-    matches = list(ANSWER_INLINE_RE.finditer(normalized))
-    if len(matches) <= 1:
-        return []  # chỉ có 1 hoặc 0 → _match_line đã xử lý
+    matches = [m for m in ANSWER_INLINE_RE.finditer(normalized) if m.start() >= start]
+    if len(matches) < min_count:
+        return []
 
     results: list[Anchor] = []
     line_x1, line_y1, line_x2, line_y2 = line.bbox
@@ -137,19 +143,11 @@ def _extract_inline_answers(
 
     for i, m in enumerate(matches):
         label = m.group(1)
-        # Ước lượng bbox theo vị trí ký tự
         char_start = m.start()
-        if i + 1 < len(matches):
-            char_end = matches[i + 1].start()
-        else:
-            char_end = text_len
-        frac_start = char_start / text_len
-        frac_end = char_end / text_len
-        est_x1 = line_x1 + frac_start * line_w
-        est_x2 = line_x1 + frac_end * line_w
-
-        # Text đáp án = substring từ match hiện tại đến match kế
-        ans_text = normalized[m.start():char_end].strip()
+        char_end = matches[i + 1].start() if i + 1 < len(matches) else text_len
+        est_x1 = line_x1 + (char_start / text_len) * line_w
+        est_x2 = line_x1 + (char_end / text_len) * line_w
+        ans_text = normalized[char_start:char_end].strip()
 
         results.append(Anchor(
             page_index=page_index,
@@ -213,6 +211,15 @@ def extract_anchors(blocks_per_page: list[list[Block]]) -> list[Anchor]:
                             confidence=line.confidence,
                             source="regex",
                         ))
+                        # Fix: đáp án có thể DÍNH cùng dòng câu hỏi
+                        # ("Question 4: A. liberty B. reliable...") → tách đáp án
+                        # nằm SAU marker câu hỏi (start = cuối "Câu N"/"Question N").
+                        if anchor_type == AnchorType.QUESTION:
+                            inline = _extract_inline_answers(
+                                line, block.page_index, normalized,
+                                start=len(matched_text), min_count=1,
+                            )
+                            anchors.extend(inline)
 
     logger.info(f"Extracted {len(anchors)} anchors total")
     _log_anchor_stats(anchors)

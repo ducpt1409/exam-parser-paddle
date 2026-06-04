@@ -6,6 +6,69 @@ Format: `[Phase X.Y] - YYYY-MM-DD - Title`
 
 ---
 
+## [Phase 2.6] - 2026-06-03 - Fix azota 0-crop + đáp án dính dòng + group leak
+
+### Mục đích
+Test 3 đề (toan8 4b9fece1, azota 5b5763ee, tienganh 6365f51b) phát hiện loạt lỗi:
+azota crop 0 ảnh; đề Anh thiếu đáp án A; câu cuối nhóm nuốt đoạn dẫn nhóm sau.
+
+### Vấn đề & nguyên nhân (verify bằng dữ liệu thật)
+
+**1. AZOTA crop = 0** (nghiêm trọng nhất). `_find_solution_boundary` match cụm
+"lời giải chi tiết" trong CÂU HƯỚNG DẪN dài ở TRANG 1 ("Phần lời giải chi tiết:
+Bắt đầu phần này...") → tưởng phần giải bắt đầu ngay đầu đề → loại sạch 94 câu.
+Marker thật là heading ngắn "HƯỚNG DẪN GIẢI CHI TIẾT" ở trang 8.
+
+**2. Đề Anh thiếu đáp án A** (q4,5,27,28). OCR gộp "Question 4: A. liberty" thành
+1 dòng → phân loại QUESTION (ưu tiên) → "A. liberty" không được tách thành đáp án.
+
+**3. Đề Anh thiếu đáp án B** (q10,14). OCR đọc "B." → "B," (dấu phẩy) → regex trượt.
+Hệ quả phụ: dòng "B," bị tính vào content (q10 content kèm đáp án).
+
+**4. Câu cuối nhóm nuốt đoạn dẫn nhóm sau** (q3 kèm "Mark the letter…", q36 kèm
+"Read the following passage…", toan8 q4 kèm "Phần II"). `end` câu = đầu câu kế,
+không dừng ở group header chen giữa.
+
+**5. Đoạn dẫn nhóm không được crop riêng.**
+
+### Giải pháp
+**`anchor_extractor.py`**
+- Regex đáp án + inline: `[\.\)]` → `[\.\),]` (chấp nhận dấu phẩy OCR). [Fix 3]
+- `_extract_inline_answers(start, min_count)`: quét đáp án SAU marker câu hỏi trên
+  cùng dòng ("Question 4: A. …") + đáp án dàn hàng ngang. [Fix 2]
+
+**`snake_walker.py`**
+- `_find_solution_boundary`: marker chỉ nhận khi là HEADING NGẮN (≤45 ký tự, không
+  phải câu hướng dẫn dài) + tín hiệu số câu reset mạnh (drop ≥5). Lấy mốc sớm nhất. [Fix 1]
+- Clip `end` câu tại GROUP HEADER chen giữa → không nuốt đoạn dẫn nhóm sau. [Fix 4]
+- Mọi group: tính lead-in region [header → câu đầu] = chỉ dẫn + passage → crop riêng. [Fix 5]
+- Đáp án nguồn `regex_inline` (bbox ước lượng) → set needs_review.
+
+**`cropper.py`**
+- `crop_group_lead()` → `g{k}_header.png`, gán `group.header_image` (+ passage_image nếu PASSAGE).
+
+### Kết quả (verify qua simulation trên blocks.json — không chạy Paddle)
+| | Trước | Sau |
+|---|---|---|
+| azota câu trích | 0 | **47** (1-50, boundary trang 8) ✅ |
+| tienganh câu | 50 (boundary trang 6 đúng) | 50 ✅ |
+| q4/q5/q27/q28 đáp án | thiếu A | **A,B,C,D** ✅ |
+| q10/q14 đáp án | thiếu B | **A,B,C,D** ✅ |
+| q3 end | nuốt "Mark the letter" | clip tại y=1699 ✅ |
+| q36 end | nuốt "Read passage" | clip tại y=356 ✅ |
+| group lead-in | không crop | `g{k}_header.png` ✅ |
+
+### Còn lại (PHẠM VI SAU)
+- Đáp án dính dòng câu hỏi (pronunciation/stress): bbox A ước lượng theo tỉ lệ ký tự
+  → crop A có thể kèm "Question N:". Đã set needs_review. Cần OCR-lại vùng hoặc VLM để chuẩn.
+- q12 blank "____": OCR không bắt nét gạch dưới → content thiếu phần điền (giới hạn OCR).
+- content_text thứ tự từ với toán phân số (cosmetic — bbox crop đúng).
+
+### Cần làm
+Chạy lại `parse_cli.py` cả 3 đề trên WSL, kiểm tra overlay + crops thực tế.
+
+---
+
 ## [Phase 2.5] - 2026-06-03 - Fix vùng crop đáp án + reading-order + clip câu cuối
 
 ### Mục đích

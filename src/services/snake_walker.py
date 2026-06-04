@@ -225,46 +225,46 @@ def _find_solution_boundary(
 
     Trả về None nếu không phát hiện (đề bình thường).
     """
-    # Cách 1: Tìm marker text trong lines
+    candidates: list[tuple[tuple[int, float], str]] = []
+
+    # Cách 1: Marker text — CHỈ chấp nhận khi là HEADING NGẮN đứng riêng,
+    # KHÔNG phải câu hướng dẫn dài (vd azota trang 1: "Phần lời giải chi tiết:
+    # Bắt đầu phần này..." dài 75+ ký tự → bỏ qua, tránh false-positive đầu đề).
+    MARKER_MAX_LEN = 45
     for ln in all_lines:
         text = ln.text.strip()
         if not text:
             continue
         norm = _strip_accents(text).lower().strip()
+        if len(norm) > MARKER_MAX_LEN:
+            continue  # câu dài → không phải heading lời giải
 
-        # Check marker lời giải
-        for marker in _SOLUTION_MARKERS:
-            if marker in norm:
-                pos = _gpos_of_line(ln)
-                logger.info(f"Phát hiện marker lời giải: \"{text}\" tại page={pos[0]}, y={pos[1]:.0f}")
-                return pos
+        if any(m in norm for m in _SOLUTION_MARKERS) or _END_MARKERS_REGEX.match(norm):
+            candidates.append((_gpos_of_line(ln), f'marker "{text}"'))
+            break  # marker đầu tiên (đã sort theo vị trí)
 
-        # Check "hết" / bảng đáp án
-        if _END_MARKERS_REGEX.match(norm):
-            pos = _gpos_of_line(ln)
-            logger.info(f"Phát hiện marker kết thúc: \"{text}\" tại page={pos[0]}, y={pos[1]:.0f}")
-            return pos
-
-    # Cách 2 (Fallback): Kiểm tra số câu không tăng đơn điệu
+    # Cách 2: Số câu nhảy lùi MẠNH (reset về đầu) — phần lời giải lặp lại "Câu 1..".
+    # Yêu cầu drop đáng kể (>=5) để tránh nhầm 1 lỗi OCR số câu lẻ tẻ.
     q_anchors = sorted(
         [a for a in anchors if a.type == AnchorType.QUESTION and a.number is not None],
         key=_gpos_of_anchor,
     )
-    if len(q_anchors) > 0:
-        max_seen = -1
-        for a in q_anchors:
-            n = a.number
-            if n is not None:
-                if n <= max_seen and max_seen > 1:
-                    pos = _gpos_of_anchor(a)
-                    logger.info(
-                        f"Fallback: số câu nhảy lùi (Câu {n} sau max={max_seen}) "
-                        f"→ ranh giới lời giải tại page={pos[0]}, y={pos[1]:.0f}"
-                    )
-                    return pos
-                max_seen = max(max_seen, n)
+    max_seen = -1
+    for a in q_anchors:
+        n = a.number
+        if n is not None:
+            if n <= max_seen - 5 and max_seen >= 10:
+                candidates.append((_gpos_of_anchor(a), f"số câu reset (Câu {n} sau max={max_seen})"))
+                break
+            max_seen = max(max_seen, n)
 
-    return None
+    if not candidates:
+        return None
+
+    # Lấy mốc SỚM NHẤT trong các tín hiệu
+    pos, reason = min(candidates, key=lambda c: c[0])
+    logger.info(f"Ranh giới lời giải: {reason} tại page={pos[0]}, y={pos[1]:.0f}")
+    return pos
 
 
 # ============================================================
@@ -483,6 +483,7 @@ def snake_walk(
     # ================================================================
     questions: list[Question] = []
     layouts: dict[str, QuestionLayout] = {}
+    q_start_map: dict[str, tuple[int, float]] = {}  # q_id → start (cho group lead-in)
 
     seen_numbers: set[int] = set()
     prev_number: Optional[int] = None
@@ -503,6 +504,14 @@ def snake_walk(
         else:
             end = content_end if content_end is not None else (last_page, inf_y)
 
+        # Clip tại GROUP HEADER chen giữa (đầu nhóm câu kế) — tránh câu cuối nhóm
+        # nuốt "Mark the letter…" / "Read the following passage…" của nhóm tiếp theo.
+        for ga in group_anchors:
+            gp = _gpos_of_anchor(ga)
+            if start < gp < end:
+                end = gp
+                break  # group_anchors đã sort → cái đầu là sớm nhất
+
         needs_review = False
 
         # Trùng số câu → bỏ qua (giữ cái đầu)
@@ -510,6 +519,7 @@ def snake_walk(
             logger.warning(f"Trùng số câu: Câu {q_num}")
             continue
         seen_numbers.add(q_num)
+        q_start_map[q_id] = start
 
         # Số không liên tục
         if prev_number is not None and q_num > prev_number + 1:
@@ -569,6 +579,10 @@ def snake_walk(
                 continue
             seen_labels.add(label)
             answers.append(Answer(label=label, text=a_anchor.text.strip()))
+
+        # Đáp án tách từ inline (dính dòng / dàn hàng) → bbox ước lượng → cần review
+        if any(a.source == "regex_inline" for a in q_answers_anchors):
+            needs_review = True
 
         # ================================================================
         # Bước 4 — Tách content vs answers region (cho crop)
@@ -722,50 +736,38 @@ def snake_walk(
                         g_question_ids.append(q.id)
                         q.group_id = g_id
 
-            # Passage text: lines giữa group header và câu đầu tiên
-            passage_text = ""
-            passage_region = MultiRegion()
+            # Lead-in region: TỪ group header ĐẾN câu đầu tiên của nhóm.
+            # Bao gồm cả dòng chỉ dẫn ("Mark the letter…") VÀ passage (nếu có).
+            # Crop riêng cho MỌI group (không chỉ PASSAGE) — user cần đoạn dẫn nhóm.
+            lead_text = ""
+            lead_region = MultiRegion()
 
-            if g_type == GroupType.PASSAGE and g_question_ids:
-                first_q_in_group = None
-                for q in questions:
-                    if q.id == g_question_ids[0]:
-                        first_q_in_group = q
-                        break
+            if g_question_ids and g_question_ids[0] in q_start_map:
+                lead_start = (g_anchor.page_index, g_anchor.bbox[1])  # đỉnh dòng header
+                lead_end = q_start_map[g_question_ids[0]]             # đầu câu đầu tiên
 
-                if first_q_in_group:
-                    first_q_anchor = None
-                    for qa in q_anchors:
-                        if qa.number == first_q_in_group.number:
-                            first_q_anchor = qa
-                            break
-
-                    if first_q_anchor:
-                        passage_start = _gpos(g_anchor.page_index, g_anchor.bbox[3])
-                        passage_end = _gpos_of_anchor(first_q_anchor)
-
-                        passage_lines = [
-                            ln for ln in all_lines
-                            if _in_range(_gpos_of_line(ln), passage_start, passage_end)
-                            and ln.text.strip()  # chỉ line có text
-                        ]
-                        passage_text = " ".join(ln.text.strip() for ln in passage_lines)
-                        passage_region = _compute_multi_region_from_lines(
-                            passage_lines, passage_start, passage_end,
-                            page_heights, page_widths
-                        )
+                lead_lines = [
+                    ln for ln in all_lines
+                    if _in_range(_gpos_of_line(ln), lead_start, lead_end)
+                    and ln.text.strip()
+                ]
+                lead_text = " ".join(ln.text.strip() for ln in lead_lines)
+                lead_region = _compute_multi_region_from_lines(
+                    lead_lines, lead_start, lead_end, page_heights, page_widths
+                )
 
             group = Group(
                 id=g_id,
                 type=g_type,
                 header_text=g_anchor.text.strip(),
-                passage_text=passage_text,
+                # PASSAGE: lead-in chứa đoạn văn → lưu passage_text; nhóm khác để header_text mô tả
+                passage_text=lead_text if g_type == GroupType.PASSAGE else "",
                 question_ids=g_question_ids,
             )
             groups.append(group)
 
-            if passage_region.parts:
-                group_layouts[g_id] = passage_region
+            if lead_region.parts:
+                group_layouts[g_id] = lead_region
 
     logger.info(f"Snake Walker: tạo {len(groups)} groups")
 
