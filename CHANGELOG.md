@@ -6,6 +6,81 @@ Format: `[Phase X.Y] - YYYY-MM-DD - Title`
 
 ---
 
+## [Phase 3.2] - 2026-06-05 - VLM Verifier + CLI tích hợp Stage 7
+
+### Mục đích
+Orchestrator lazy: chọn câu → gọi VLM batch async → merge kết quả vào Exam. Tích hợp vào CLI là Stage 7.
+
+### Vấn đề giải quyết
+- Câu thiếu đáp án (OCR sót) → VLM nhìn ảnh bổ sung.
+- Loại câu UNKNOWN → VLM classify chính xác.
+- Content/figure bị cắt → VLM báo signal re-crop full-width.
+
+### Giải pháp
+- **`src/services/vlm_verifier.py`** (MỚI):
+  - `select_questions()`: lazy gating — chỉ gọi VLM khi needs_review/UNKNOWN/answers≠4/confidence<0.6.
+  - `_merge_result()`: bổ sung answer (KHÔNG ghi đè khi VLM thấy ít hơn), update type/flags, OR logic flags.
+  - `_recrop_fullwidth()`: mở rộng bbox → full-width band, gọi lại cropper.
+  - `verify_exam()`: batch async (Semaphore=2), fail-safe, cập nhật exam stats.
+- **`scripts/parse_cli.py`** (SỬA):
+  - Thêm Stage [7/7] VLM Verify sau Cropper.
+  - Cờ `--no-vlm` (ép tắt VLM, debug Phase 2).
+  - `parse.log` ghi full pipeline log.
+  - Snapshot trước/sau VLM: so sánh n_answers, n_UNKNOWN, n_review.
+  - VLM stats trong summary.txt.
+
+### Kết quả mong đợi
+- Đề Toán 8: ≈0 VLM calls (đề dễ, không trigger gating).
+- Đề azota: VLM bổ sung đáp án thiếu, classify math questions, re-crop đồ thị.
+- Pipeline không crash dù Ollama timeout/lỗi (fail-safe).
+
+---
+
+## [Phase 3.1] - 2026-06-05 - VLM Client + Schema structured output
+
+### Mục đích
+Low-level client gọi Ollama Qwen3-VL phân tích ảnh câu hỏi. Schema Pydantic ép JSON response.
+
+### Giải pháp
+- **`src/schemas/vlm.py`** (MỚI): `VLMQuestionType`, `VLMAnswer`, `VLMQuestionResult` — dùng với Ollama `format=<json schema>`.
+- **`src/services/vlm_client.py`** (THAY placeholder):
+  - `analyze_question_async()`: httpx async, gửi ảnh base64 (JPEG), structured JSON output.
+  - Resize ảnh >1600px trước khi gửi (Qwen3-VL tốt với ảnh vừa).
+  - Retry 1 lần khi timeout/lỗi mạng. Fail-safe: trả None.
+  - `vlm.log` riêng: question_id, kích thước ảnh, thời gian, kết quả.
+  - Prompt tiếng Việt: mô tả CẤU TRÚC, KHÔNG giải bài.
+
+### Trade-off
+- ✅ Structured output (Ollama format parameter) → không cần parse tay.
+- ✅ Ảnh JPEG quality=85 giảm size gửi API (~3x nhỏ hơn PNG).
+- ⚠️ Semaphore=2 giới hạn đồng thời — 32B model nặng GPU.
+
+---
+
+## [Phase 3.0] - 2026-06-05 - Kế hoạch VLM Semantic Layer + chốt baseline 2.8
+
+### Mục đích
+Chốt kế hoạch Phase 3 (Qwen3-VL-32B, lazy) để vá lỗi OCR mà rule engine không sửa được
+(đáp án mất, công thức nát, đồ thị bị cắt, loại câu mơ hồ).
+
+### Quyết định baseline
+- **Quay về Phase 2.8** vì 2.9/2.10 làm sai nhận diện câu đề Tiếng Anh (đã revert code + CHANGELOG).
+- Phase 3 khởi đầu từ 2.8 — hợp lệ vì VLM là tầng cộng thêm, độc lập rule engine.
+- Fix hình học 2.9 (`answer_block_top`) + 2.10 (graph band) KHÔNG khôi phục ở rule engine
+  → VLM gánh thay qua cơ chế re-crop (PHASE3_GUIDE §6.4).
+- Khuyến nghị cherry-pick lại fix group-regex word-boundary của 2.10
+  (`r"^\s*(phan)\s+(?:[ivxlcdm]+|\d+)\b"`) — độc lập, tránh "group giả" nuốt câu.
+
+### Giải pháp (chưa code)
+- `PHASE3_GUIDE.md` — spec đầy đủ cho antigravity: gating lazy, `schemas/vlm.py`,
+  `vlm_client.py` (Ollama /api/chat + format JSON + async), `vlm_verifier.py`
+  (merge + re-crop có điều kiện), Stage [7] trong `parse_cli.py`, cờ `--no-vlm`.
+
+### Còn lại
+- Antigravity implement theo thứ tự 3.1→3.5. Phase 4+: chấm `is_correct`, MinIO upload, API serve.
+
+---
+
 ## [Phase 2.8] - 2026-06-03 - Recover câu OCR mất marker + bare answer marker (đề azota)
 
 ### Mục đích

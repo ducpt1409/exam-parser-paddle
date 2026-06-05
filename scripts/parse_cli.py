@@ -1,18 +1,21 @@
-"""CLI Phase 1+2: Pipeline Preprocess + PaddleOCR + Anchor + Snake Walker + Classifier + Cropper.
+"""CLI Phase 1+2+3: Pipeline Preprocess + PaddleOCR + Anchor + Snake Walker + Classifier + Cropper + VLM Verify.
 
 Usage:
     python scripts/parse_cli.py input/de.pdf
     python scripts/parse_cli.py input/de.pdf --dpi 400
     python scripts/parse_cli.py input/de.pdf --save-images   # lưu rendered pages
     python scripts/parse_cli.py input/de.pdf --no-crop       # chỉ tới classify (debug)
+    python scripts/parse_cli.py input/de.pdf --no-vlm        # bỏ VLM verify (debug Phase 2)
 
 Output (vào output/{exam_id}/):
     blocks.json    - PaddleOCR output
     anchors.json   - extracted anchors
-    exam.json      - Exam structure (Phase 2)
+    exam.json      - Exam structure (Phase 2+3)
     summary.txt    - tóm tắt
     crops/         - ảnh từng câu/đáp án/passage (Phase 2)
     overlay/       - page_XX.png có bbox màu (Phase 2)
+    vlm.log        - VLM call log (Phase 3)
+    parse.log      - full pipeline log
     pages/*.png    - rendered pages (nếu --save-images)
 """
 from __future__ import annotations
@@ -38,10 +41,11 @@ from src.core.logging import logger  # noqa: E402
 @click.option("--dpi", default=None, type=int, help="Render DPI (default từ .env)")
 @click.option("--no-deskew", is_flag=True, default=False, help="Tắt deskew")
 @click.option("--save-images", is_flag=True, default=False, help="Lưu rendered pages")
-@click.option("--no-crop", is_flag=True, default=False, help="Chỉ chạy tới classify (bỏ crop+overlay)")
+@click.option("--no-crop", is_flag=True, default=False, help="Chỉ chạy tới classify (bỏ crop+overlay+VLM)")
+@click.option("--no-vlm", is_flag=True, default=False, help="Bỏ VLM verify (debug Phase 2)")
 @click.option("--debug", is_flag=True, default=False, help="Verbose logging")
-def main(input_path, output_dir, dpi, no_deskew, save_images, no_crop, debug):
-    """Full pipeline: Preprocess → PaddleOCR → Anchor → Snake Walker → Classifier → Cropper."""
+def main(input_path, output_dir, dpi, no_deskew, save_images, no_crop, no_vlm, debug):
+    """Full pipeline: Preprocess → PaddleOCR → Anchor → Snake Walker → Classifier → Cropper → VLM Verify."""
     if debug:
         import logging
         logger.remove()
@@ -53,13 +57,18 @@ def main(input_path, output_dir, dpi, no_deskew, save_images, no_crop, debug):
     out.mkdir(parents=True, exist_ok=True)
     click.echo(f"📂 Output: {out}")
 
+    # Thêm parse.log
+    logger.add(str(out / "parse.log"), level="DEBUG",
+               format="{time:HH:mm:ss} | {level} | {message}")
+
     dpi = dpi or settings.default_dpi
     source_file = Path(input_path).name
+    total_stages = 7
 
     # ============================================================
     # Stage 1: Preprocess
     # ============================================================
-    click.echo(f"\n[1/6] Preprocess (DPI={dpi}, deskew={not no_deskew})...")
+    click.echo(f"\n[1/{total_stages}] Preprocess (DPI={dpi}, deskew={not no_deskew})...")
     from src.services.preprocess import preprocess
     t0 = time.time()
     images = preprocess(input_path, dpi=dpi, do_deskew=not no_deskew)
@@ -75,7 +84,7 @@ def main(input_path, output_dir, dpi, no_deskew, save_images, no_crop, debug):
     # ============================================================
     # Stage 2: PaddleOCR
     # ============================================================
-    click.echo(f"\n[2/6] PaddleOCR PP-StructureV3 "
+    click.echo(f"\n[2/{total_stages}] PaddleOCR PP-StructureV3 "
                 f"(use_gpu={settings.paddle_use_gpu})...")
     from src.services.paddle_parser import PaddleParser
     parser = PaddleParser()
@@ -116,7 +125,7 @@ def main(input_path, output_dir, dpi, no_deskew, save_images, no_crop, debug):
     # ============================================================
     # Stage 3: Anchor Extraction
     # ============================================================
-    click.echo(f"\n[3/6] Anchor Extraction...")
+    click.echo(f"\n[3/{total_stages}] Anchor Extraction...")
     from src.services.anchor_extractor import extract_anchors
     t0 = time.time()
     anchors = extract_anchors(blocks_per_page)
@@ -144,7 +153,7 @@ def main(input_path, output_dir, dpi, no_deskew, save_images, no_crop, debug):
     # ============================================================
     # Stage 4: Snake Walker (Phase 2)
     # ============================================================
-    click.echo(f"\n[4/6] Snake Walker...")
+    click.echo(f"\n[4/{total_stages}] Snake Walker...")
     from src.services.snake_walker import snake_walk, parse_exam_metadata
     t0 = time.time()
 
@@ -165,7 +174,7 @@ def main(input_path, output_dir, dpi, no_deskew, save_images, no_crop, debug):
     # ============================================================
     # Stage 5: Classifier (Phase 2)
     # ============================================================
-    click.echo(f"\n[5/6] Question Classifier...")
+    click.echo(f"\n[5/{total_stages}] Question Classifier...")
     from src.services.question_classifier import classify_all
     t0 = time.time()
     classify_all(questions, groups)
@@ -208,8 +217,10 @@ def main(input_path, output_dir, dpi, no_deskew, save_images, no_crop, debug):
     # ============================================================
     # Stage 6: Cropper (Phase 2)
     # ============================================================
+    n_crops = 0
+    n_overlay = 0
     if not no_crop:
-        click.echo(f"\n[6/6] Cropper + Debug Overlay...")
+        click.echo(f"\n[6/{total_stages}] Cropper + Debug Overlay...")
         from src.services.cropper import crop_all
         t0 = time.time()
         crop_all(exam, layouts, group_layouts, images, out)
@@ -217,7 +228,61 @@ def main(input_path, output_dir, dpi, no_deskew, save_images, no_crop, debug):
         n_overlay = len(list((out / "overlay").glob("*.png"))) if (out / "overlay").exists() else 0
         click.echo(f"   ✓ {n_crops} crop images, {n_overlay} overlay pages ({time.time() - t0:.1f}s)")
     else:
-        click.echo(f"\n[6/6] Cropper — SKIPPED (--no-crop)")
+        click.echo(f"\n[6/{total_stages}] Cropper — SKIPPED (--no-crop)")
+
+    # ============================================================
+    # Stage 7: VLM Verify (Phase 3, lazy)
+    # ============================================================
+    n_vlm_calls = 0
+    vlm_stats_text = ""
+
+    if not no_crop and not no_vlm and settings.use_vlm_verification:
+        click.echo(f"\n[7/{total_stages}] VLM Verify (Qwen3-VL, lazy)...")
+        from src.services.vlm_verifier import verify_exam
+        from src.schemas.exam import QuestionType
+
+        # Snapshot trước VLM để so sánh
+        pre_vlm_n_answers = {q.number: len(q.answers) for q in exam.questions}
+        pre_vlm_n_unknown = sum(1 for q in exam.questions if q.type == QuestionType.UNKNOWN)
+        pre_vlm_n_review = sum(1 for q in exam.questions if q.needs_review)
+
+        t0 = time.time()
+        try:
+            n_vlm_calls = verify_exam(exam, layouts, group_layouts, images, out)
+        except Exception as e:
+            logger.error(f"VLM Verify failed: {e}")
+            click.echo(f"   ⚠ VLM failed: {e}")
+            n_vlm_calls = 0
+
+        vlm_elapsed = time.time() - t0
+        click.echo(f"   ✓ {n_vlm_calls} VLM calls ({vlm_elapsed:.1f}s)")
+
+        # So sánh trước/sau
+        post_vlm_n_unknown = sum(1 for q in exam.questions if q.type == QuestionType.UNKNOWN)
+        post_vlm_n_review = sum(1 for q in exam.questions if q.needs_review)
+        answers_added = sum(
+            max(0, len(q.answers) - pre_vlm_n_answers.get(q.number, 0))
+            for q in exam.questions
+        )
+
+        vlm_stats_text = f"""
+[VLM — Phase 3]
+  VLM calls: {n_vlm_calls}
+  Time: {vlm_elapsed:.1f}s
+  Answers added by VLM: {answers_added}
+  Type UNKNOWN: {pre_vlm_n_unknown} → {post_vlm_n_unknown}
+  Needs review: {pre_vlm_n_review} → {post_vlm_n_review}
+"""
+        click.echo(vlm_stats_text)
+    else:
+        reason = "SKIPPED"
+        if no_crop:
+            reason += " (--no-crop)"
+        if no_vlm:
+            reason += " (--no-vlm)"
+        if not settings.use_vlm_verification:
+            reason += " (use_vlm_verification=False)"
+        click.echo(f"\n[7/{total_stages}] VLM Verify — {reason}")
 
     # ============================================================
     # Save exam.json
@@ -227,11 +292,14 @@ def main(input_path, output_dir, dpi, no_deskew, save_images, no_crop, debug):
     click.echo(f"\n✓ Saved exam.json")
 
     # ============================================================
-    # Summary (cập nhật: + breakdown question type, group)
+    # Summary
     # ============================================================
     q_count = sum(1 for a in anchors if a.type.value == "question")
     a_count = sum(1 for a in anchors if a.type.value == "answer")
     g_count = sum(1 for a in anchors if a.type.value == "group_header")
+
+    # Recalc type counter (may have changed after VLM)
+    type_counter_final = Counter(q.type.value for q in exam.questions)
 
     summary = f"""Exam ID: {exam_id}
 Input: {input_path}
@@ -285,6 +353,16 @@ Anchors by type:
   Crop images: {n_crops}
   Overlay pages: {n_overlay}
 """
+
+    # VLM stats
+    if vlm_stats_text:
+        summary += vlm_stats_text
+
+    # Final type distribution (after VLM)
+    if n_vlm_calls > 0:
+        summary += "\n[Question Types — Final (after VLM)]\n"
+        for t_name, n in type_counter_final.most_common():
+            summary += f"    {t_name}: {n}\n"
 
     # Metadata
     summary += f"""
