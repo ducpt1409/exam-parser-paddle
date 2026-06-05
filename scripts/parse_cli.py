@@ -53,6 +53,10 @@ def main(input_path, output_dir, dpi, no_deskew, save_images, no_crop, debug):
     out.mkdir(parents=True, exist_ok=True)
     click.echo(f"📂 Output: {out}")
 
+    # Ghi log ra file cùng folder output để soi lại sau (DEBUG đầy đủ)
+    logger.add(str(out / "parse.log"), level="DEBUG", encoding="utf-8", mode="w")
+    logger.info(f"=== Parse {input_path} → {out} ===")
+
     dpi = dpi or settings.default_dpi
     source_file = Path(input_path).name
 

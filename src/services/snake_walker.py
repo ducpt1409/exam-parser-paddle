@@ -760,6 +760,28 @@ def snake_walk(
             # Mở rộng mép phải content = mép phải full region để bắt blank "____" cuối
             # câu mà OCR bỏ sót (vd "dreams of having ______" → OCR dừng ở "having").
             content_region = _extend_right_to(content_region, full_region)
+
+            # ĐỒ THỊ / HÌNH: nếu giữa text stem và đáp án có KHOẢNG TRỐNG LỚN (PaddleOCR
+            # không đọc được hình → không có line) → mở rộng content thành BĂNG full-width
+            # bao vùng đó để crop kèm đồ thị (vd câu có "Đồ thị như hình vẽ...").
+            abp = answer_block_top[0]
+            same_pg = [ln for ln in content_lines if ln.page_index == abp]
+            text_bottom = max((ln.bbox[3] for ln in same_pg), default=start[1] if start[0] == abp else 0.0)
+            if (answer_block_top[1] - text_bottom) > 2.5 * band:
+                pwp = page_widths[abp] if abp < len(page_widths) else 2550
+                php = page_heights[abp] if abp < len(page_heights) else 3300
+                top_y = start[1] if start[0] == abp else 0.0
+                # Giữ các part content ở TRANG KHÁC (vd stem ở trang trước khi vắt trang)
+                other = [p for p in content_region.parts if p.page_index != abp]
+                # content = part trang khác + băng [stem→đáp án] bao đồ thị trên trang abp
+                content_bbox = _pad_bbox((0, top_y, pwp, answer_block_top[1]), pwp, php)
+                content_region = MultiRegion(parts=other + [Region(page_index=abp, bbox=content_bbox)])
+                # full = part trang khác + băng [stem→đáy đáp án] (giữ phần đáp án dưới)
+                full_other = [p for p in full_region.parts if p.page_index != abp]
+                full_bottom = max((p.bbox[3] for p in full_region.parts if p.page_index == abp),
+                                  default=answer_block_top[1])
+                full_bbox = _pad_bbox((0, top_y, pwp, max(full_bottom, answer_block_top[1])), pwp, php)
+                full_region = MultiRegion(parts=full_other + [Region(page_index=abp, bbox=full_bbox)])
         else:
             content_region = full_region
             content_text = " ".join(content_parts)
@@ -819,12 +841,23 @@ def snake_walk(
             )
             buckets[best_k].append(ln.bbox)
 
+        # Chiều cao tối đa hợp lý cho 1 vùng đáp án (chống region "full-page" do OCR/merge lỗi)
+        _ah = sorted(a.bbox[3] - a.bbox[1] for a in uniq_anchors)
+        ans_h = _ah[len(_ah) // 2] if _ah else 50.0
+
         answer_regions: list[tuple[str, MultiRegion]] = []
         for k, a_anchor in enumerate(uniq_anchors):
             pidx = a_anchor.page_index
             pw = page_widths[pidx] if pidx < len(page_widths) else 2550
             ph = page_heights[pidx] if pidx < len(page_heights) else 3300
             merged = _merge_bboxes(buckets[k])
+            # Clamp: vùng đáp án không cao quá ~5 dòng marker (tránh nuốt cả trang/câu khác).
+            # Giữ neo ở dòng marker (a_anchor), clamp phần dưới.
+            max_h = max(5.0 * ans_h, 220.0)
+            if merged[3] - merged[1] > max_h:
+                a_top = a_anchor.bbox[1]
+                merged = (merged[0], min(merged[1], a_top),
+                          merged[2], min(merged[3], a_top + max_h))
             padded = _pad_bbox(merged, pw, ph)
             label = a_anchor.value or f"ans{k}"
             answer_regions.append(

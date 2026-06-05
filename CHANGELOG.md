@@ -6,6 +6,37 @@ Format: `[Phase X.Y] - YYYY-MM-DD - Title`
 
 ---
 
+## [Phase 2.10] - 2026-06-04 - Group giả + clamp đáp án + crop đồ thị + log file
+
+### Mục đích
+Hoàn thiện nốt các lỗi region đề azota trước khi sang Phase 3 (VLM).
+
+### Vấn đề & fix
+1. **Group giả nuốt cả 50 câu**: 3 dòng chỉ dẫn trang 1 ("Phần **c**âu hỏi/**đ**áp án/**l**ời giải")
+   khớp nhầm regex group `^phan\s+[ivxlcdm\d]` (c,d,l ∈ tập La Mã). g3(lời giải) gom hết câu.
+   → **`anchor_extractor.py`**: regex yêu cầu số La Mã/Ả Rập là token riêng `^phan\s+(?:[ivxlcdm]+|\d+)\b`.
+   Verify: loại "Phần câu/đáp/lời", giữ "Phần I/II/1/III".
+2. **Đáp án crop full-page** (q17_B = [777,157,1121,3023]): merge/OCR lỗi → vùng cao gần cả trang.
+   → **`snake_walker.py`**: clamp chiều cao vùng đáp án ≤ max(5×marker_h, 220px), neo ở dòng marker.
+3. **Đồ thị (q3,q45) không được crop**: PaddleOCR KHÔNG detect figure trên trang đề (0 figure block
+   pages 0-6) → vùng trống, region (chỉ text-line) bỏ qua.
+   → **`snake_walker.py`**: phát hiện KHOẢNG TRỐNG LỚN giữa stem & đáp án (>2.5×marker_h) → content/full
+   thành BĂNG full-width bao vùng đó (kèm đồ thị). Giữ part trang khác khi vắt trang.
+4. **Log ra file**: **`parse_cli.py`** ghi `output/{id}/parse.log` (DEBUG) để soi lại.
+
+### Kết quả (verify simulation)
+| | Kết quả |
+|---|---|
+| Group regex | loại 3 group giả azota; giữ "Phần I/II" toan8 ✅ |
+| Graph band | q45 gap=589 → BAND ✅; toan8/tienganh tight (không regression) ✅ |
+| Clamp đáp án | vùng > 5 dòng bị clamp về quanh marker ✅ |
+
+### Còn lại → PHASE 3 (VLM)
+Các lỗi OCR-ceiling không thể fix bằng rule: q1 mất đáp án A,C; q7 không đáp án; công thức/đồ thị
+đọc sai. Cần Qwen3-VL đọc trực tiếp vùng ảnh. Tất cả đã flag needs_review.
+
+---
+
 ## [Phase 2.9] - 2026-06-04 - Ranh giới content/đáp án theo answer-block-top (phân số)
 
 ### Mục đích

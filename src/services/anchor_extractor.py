@@ -47,7 +47,9 @@ ANCHOR_PATTERNS: dict[AnchorType, list[tuple[Pattern, int | None]]] = {
         (re.compile(r"^\s*([a-d])\s*\)\s*\S"), 1),
     ],
     AnchorType.GROUP_HEADER: [
-        (re.compile(r"^\s*(phan)\s+[ivxlcdm\d]", re.IGNORECASE), None),
+        # "Phần I", "Phần II", "Phần 1" — số La Mã/Ả Rập là TOKEN RIÊNG (\b).
+        # Tránh khớp nhầm "Phần câu hỏi" / "Phần đáp án" / "Phần lời giải" (c,d,l ∈ La Mã).
+        (re.compile(r"^\s*(phan)\s+(?:[ivxlcdm]+|\d+)\b", re.IGNORECASE), None),
         (re.compile(r"^\s*(doc\s+(?:doan|van\s+ban))", re.IGNORECASE), None),
         (re.compile(r"^\s*(cho\s+(?:doan|doan\s+van|bieu\s+do|bang))", re.IGNORECASE), None),
         (re.compile(r"^\s*(mark\s+the\s+letter)", re.IGNORECASE), None),
