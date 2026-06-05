@@ -6,6 +6,48 @@ Format: `[Phase X.Y] - YYYY-MM-DD - Title`
 
 ---
 
+## [Phase 3.3] - 2026-06-05 - Sửa re-crop VLM không bao giờ kích hoạt (ảnh crop không đổi)
+
+### Mục đích
+Sau khi chạy thật đề azota (output 920dc046): VLM gọi 18 lần, +20 đáp án, nhưng
+**re-crops = 0** → ảnh trong crops/ y hệt cũ. Các câu crop sai vẫn sai.
+
+### Vấn đề (chẩn đoán từ vlm.log + exam.json)
+1. **Điều kiện re-crop không bao giờ đúng**: `not content_complete or (has_figure and not figure_complete)`.
+   - VLM báo `content_complete=True` cho TẤT CẢ câu — vì nó chỉ nhìn ẢNH ĐÃ CROP,
+     phần bị cắt nằm NGOÀI ảnh nên nó không thấy → tưởng đủ (mù với phần đã mất).
+   - `has_figure=False` cho tất cả → nhánh figure chết, kể cả 5 câu `figure_complete=False`.
+   → Toàn bộ region-repair inert. Đáp án VLM bổ sung chỉ là TEXT (`image=None`), không tạo lại ảnh.
+2. **`_recrop_fullwidth` chỉ nới chiều NGANG** (full-width, y±20) → kể cả khi chạy cũng
+   không cứu được vết cắt theo CHIỀU DỌC (đồ thị/tử số phân số) — vốn là ca chính.
+
+### Giải pháp (`src/services/vlm_verifier.py`)
+1. **Trigger re-crop khi `answers_added > 0`**: VLM bổ sung được đáp án ⇒ crop chắc chắn
+   thiếu đáp án đó. Tín hiệu này đáng tin hơn `content_complete` (vốn mù). Tách image-repair
+   khỏi phán đoán "complete" của VLM.
+2. **`_recrop_fullwidth` nới CHIỀU DỌC tới câu trước/sau**: build `regions_by_page`
+   (y_top/y_bottom mọi câu/trang); mép trên nới lên tới đáy câu liền trước, mép dưới
+   xuống tới đỉnh câu liền sau (chừa GAP=4px), không hàng xóm → nới 12% chiều cao trang.
+   Không bao giờ thu hẹp so với vùng gốc; kẹp trong trang.
+
+### Kết quả (simulate trên bbox exam.json 920dc046)
+| Câu | cao gốc → band mới | up/down |
+|---|---|---|
+| q29 | 273 → 708px | ↑↓ |
+| q47 | 383 → 838px | ↑↓ |
+| q13/16/38 | +nới 2 phía | ↑↓ |
+| q3 | chạm đáy trang (cap) | ↑ |
+
+→ 6 câu azota bổ sung đáp án (q3,13,16,29,38,47) sẽ được re-crop band rộng chứa đủ nội dung.
+
+### Còn lại
+- Câu có đồ thị NHƯNG không bị flag (vd q45: đủ 4 đáp án, type biết, review=False) →
+  gating bỏ qua, VLM không nhìn tới. Muốn xử lý cần mở gating cho câu has_figure/đồ thị (cân nhắc Phase 3.4).
+- Đáp án VLM thêm vẫn `image=None` (chưa tách crop riêng từng đáp án) — full_image đã chứa, đủ để review.
+- Đề Toán 8 / Tiếng Anh: gating ít/không trigger → cần verify không hồi quy khi chạy lại.
+
+---
+
 ## [Phase 3.2] - 2026-06-05 - VLM Verifier + CLI tích hợp Stage 7
 
 ### Mục đích

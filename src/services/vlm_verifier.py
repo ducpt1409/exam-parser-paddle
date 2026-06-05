@@ -147,6 +147,10 @@ def _merge_result(q: Question, result: VLMQuestionResult) -> dict:
 
         if stats["answers_added"] > 0:
             q.needs_review = True  # đánh dấu để người duyệt biết
+            # VLM bổ sung được đáp án ⇒ crop hiện tại gần như CHẮC CHẮN thiếu đáp án đó
+            # (OCR/Phase 2 cắt sót). Tín hiệu này ĐÁNG TIN hơn content_complete của VLM
+            # (vốn mù với phần đã bị cắt khỏi ảnh) → ép re-crop band rộng để ảnh mới chứa đủ.
+            stats["recrop_needed"] = True
 
         # Sort lại answers theo label
         q.answers.sort(key=lambda a: a.label.upper())
@@ -187,12 +191,19 @@ def _merge_result(q: Question, result: VLMQuestionResult) -> dict:
 def _recrop_fullwidth(
     q: Question,
     layouts: dict[str, QuestionLayout],
+    regions_by_page: dict[int, list[tuple[float, float]]],
     images: list[Image.Image],
     out_dir: Path,
     page_widths: list[float],
     page_heights: list[float],
 ) -> None:
-    """Re-crop câu hỏi bằng full-width band giữa anchor câu này → câu kế.
+    """Re-crop câu hỏi bằng band full-width nới CHIỀU DỌC tới câu trước/sau.
+
+    Lý do nới dọc: triệu chứng "thiếu đáp án / đồ thị / tử số bị cắt" hầu hết là vết
+    cắt THEO CHIỀU DỌC. Chỉ mở chiều ngang (bản cũ) không cứu được. Ở đây ta nới:
+      - mép trên LÊN tới đáy câu liền trước trên cùng trang (max bottom của vùng nằm trên).
+      - mép dưới XUỐNG tới đỉnh câu liền sau trên cùng trang (min top của vùng nằm dưới).
+    Nếu không có hàng xóm trên trang → nới một biên an toàn (12% chiều cao trang).
 
     Dùng lại hàm crop của Phase 2 (cropper module).
     """
@@ -202,14 +213,29 @@ def _recrop_fullwidth(
     if not layout or not layout.full.parts:
         return
 
-    # Mở rộng bbox thành full-width
+    GAP = 4.0           # chừa vài px để không nuốt chữ của câu hàng xóm
+    FALLBACK = 0.12     # không có hàng xóm → nới 12% chiều cao trang
+
     new_parts: list[Region] = []
     for part in layout.full.parts:
-        pw = page_widths[part.page_index] if part.page_index < len(page_widths) else 2550
-        ph = page_heights[part.page_index] if part.page_index < len(page_heights) else 3300
+        pw = page_widths[part.page_index] if part.page_index < len(page_widths) else 2550.0
+        ph = page_heights[part.page_index] if part.page_index < len(page_heights) else 3300.0
         x1, y1, x2, y2 = part.bbox
-        # Full-width band: giữ y nhưng mở x ra toàn trang
-        new_bbox = (0, max(0, y1 - 20), pw, min(ph, y2 + 20))
+
+        others = regions_by_page.get(part.page_index, [])
+        # Đáy của các vùng nằm HẲN trên câu này (b <= y1) → trần để nới lên.
+        ups = [b for (a, b) in others if b <= y1 + 1.0]
+        # Đỉnh của các vùng nằm HẲN dưới câu này (a >= y2) → sàn để nới xuống.
+        downs = [a for (a, b) in others if a >= y2 - 1.0]
+
+        new_y1 = (max(ups) + GAP) if ups else (y1 - FALLBACK * ph)
+        new_y2 = (min(downs) - GAP) if downs else (y2 + FALLBACK * ph)
+
+        # Không bao giờ thu hẹp so với vùng gốc; kẹp trong trang.
+        new_y1 = max(0.0, min(new_y1, y1))
+        new_y2 = min(ph, max(new_y2, y2))
+
+        new_bbox = (0.0, new_y1, pw, new_y2)
         new_parts.append(Region(page_index=part.page_index, bbox=new_bbox))
 
     new_region = MultiRegion(parts=new_parts)
@@ -270,6 +296,15 @@ def verify_exam(
     page_widths = [float(img.width) for img in images]
     page_heights = [float(img.height) for img in images]
 
+    # Map page_index → list (y_top, y_bottom) của TẤT CẢ vùng câu (full region),
+    # để re-crop biết biên câu trước/sau mà nới chiều dọc cho đúng.
+    regions_by_page: dict[int, list[tuple[float, float]]] = {}
+    for ql in layouts.values():
+        for part in ql.full.parts:
+            regions_by_page.setdefault(part.page_index, []).append(
+                (part.bbox[1], part.bbox[3])
+            )
+
     # Batch async với semaphore (giới hạn 2 calls đồng thời)
     n_calls = 0
     total_stats = {
@@ -323,8 +358,8 @@ def verify_exam(
                     # Re-crop nếu cần
                     if stats["recrop_needed"]:
                         try:
-                            _recrop_fullwidth(q, layouts, images, out_dir,
-                                             page_widths, page_heights)
+                            _recrop_fullwidth(q, layouts, regions_by_page, images,
+                                             out_dir, page_widths, page_heights)
                             total_stats["recrop"] += 1
                         except Exception as e:
                             logger.error(f"q{q.number}: lỗi re-crop — {e}")
