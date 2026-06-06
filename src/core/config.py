@@ -38,10 +38,22 @@ class Settings(BaseSettings):
 
     # --- Pipeline ---
     default_dpi: int = 300
-    use_vlm_verification: bool = True
-    use_vlm_type_classify: bool = True
+    use_vlm_verification: bool = False    # Phase 3 VLM tắt mặc định (Phase 4/5: Paddle+Snake+MinIO)
+    use_vlm_type_classify: bool = False
     deskew_threshold_degrees: float = 0.5
     webp_quality: int = 85
+
+    # --- MinIO upload (Phase 4) ---
+    use_minio_upload: bool = True         # upload crop + exam.json lên MinIO
+    minio_presign_days: int = 7           # TTL presigned URL (ngày)
+    minio_prefix: str = ""                # prefix key tùy chọn, vd "exams/"
+    minio_save_raw: bool = True           # upload luôn file gốc (PDF) lên MinIO
+
+    # --- MongoDB (lịch sử đề thi) ---
+    use_mongo: bool = True                # lưu mỗi đề = 1 bản ghi lịch sử
+    mongo_uri: str = "mongodb://localhost:27017"
+    mongo_db: str = "exam_parser"
+    mongo_collection: str = "exams"       # collection lịch sử đề thi
 
     # --- API ---
     api_host: str = "0.0.0.0"

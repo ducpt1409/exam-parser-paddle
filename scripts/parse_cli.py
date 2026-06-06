@@ -1,21 +1,23 @@
-"""CLI Phase 1+2+3: Pipeline Preprocess + PaddleOCR + Anchor + Snake Walker + Classifier + Cropper + VLM Verify.
+"""CLI Phase 1+2+4+5: Preprocess + PaddleOCR + Anchor + Snake Walker + Classifier + Cropper + MinIO + JSON.
+
+VLM (Phase 3) TẮT mặc định. Luồng: Paddle + Snake → cắt hình → upload MinIO → exam.json.
 
 Usage:
     python scripts/parse_cli.py input/de.pdf
     python scripts/parse_cli.py input/de.pdf --dpi 400
     python scripts/parse_cli.py input/de.pdf --save-images   # lưu rendered pages
     python scripts/parse_cli.py input/de.pdf --no-crop       # chỉ tới classify (debug)
-    python scripts/parse_cli.py input/de.pdf --no-vlm        # bỏ VLM verify (debug Phase 2)
+    python scripts/parse_cli.py input/de.pdf --no-upload     # cắt local, KHÔNG upload MinIO
 
 Output (vào output/{exam_id}/):
     blocks.json    - PaddleOCR output
     anchors.json   - extracted anchors
-    exam.json      - Exam structure (Phase 2+3)
+    exam.json      - Exam structure CUỐI (Phase 5: chứa minio_key + presigned url)
     summary.txt    - tóm tắt
     crops/         - ảnh từng câu/đáp án/passage (Phase 2)
     overlay/       - page_XX.png có bbox màu (Phase 2)
-    vlm.log        - VLM call log (Phase 3)
     parse.log      - full pipeline log
+    → MinIO: {bucket}/{exam_id}/crops/*.png + {exam_id}/exam.json (Phase 4)
     pages/*.png    - rendered pages (nếu --save-images)
 """
 from __future__ import annotations
@@ -41,10 +43,11 @@ from src.core.logging import logger  # noqa: E402
 @click.option("--dpi", default=None, type=int, help="Render DPI (default từ .env)")
 @click.option("--no-deskew", is_flag=True, default=False, help="Tắt deskew")
 @click.option("--save-images", is_flag=True, default=False, help="Lưu rendered pages")
-@click.option("--no-crop", is_flag=True, default=False, help="Chỉ chạy tới classify (bỏ crop+overlay+VLM)")
-@click.option("--no-vlm", is_flag=True, default=False, help="Bỏ VLM verify (debug Phase 2)")
+@click.option("--no-crop", is_flag=True, default=False, help="Chỉ chạy tới classify (bỏ crop+overlay+upload)")
+@click.option("--no-vlm", is_flag=True, default=False, help="(deprecated) VLM đã tắt mặc định Phase 4")
+@click.option("--no-upload", is_flag=True, default=False, help="Bỏ upload MinIO (chỉ lưu crop local)")
 @click.option("--debug", is_flag=True, default=False, help="Verbose logging")
-def main(input_path, output_dir, dpi, no_deskew, save_images, no_crop, no_vlm, debug):
+def main(input_path, output_dir, dpi, no_deskew, save_images, no_crop, no_vlm, no_upload, debug):
     """Full pipeline: Preprocess → PaddleOCR → Anchor → Snake Walker → Classifier → Cropper → VLM Verify."""
     if debug:
         import logging
@@ -63,7 +66,7 @@ def main(input_path, output_dir, dpi, no_deskew, save_images, no_crop, no_vlm, d
 
     dpi = dpi or settings.default_dpi
     source_file = Path(input_path).name
-    total_stages = 7
+    total_stages = 8
 
     # ============================================================
     # Stage 1: Preprocess
@@ -231,65 +234,82 @@ def main(input_path, output_dir, dpi, no_deskew, save_images, no_crop, no_vlm, d
         click.echo(f"\n[6/{total_stages}] Cropper — SKIPPED (--no-crop)")
 
     # ============================================================
-    # Stage 7: VLM Verify (Phase 3, lazy)
+    # Stage 7: Upload MinIO (Phase 4) — set minio_key/url cho mọi crop
     # ============================================================
-    n_vlm_calls = 0
-    vlm_stats_text = ""
+    n_uploaded = 0
+    raw_info = None
+    minio_stats_text = ""
+    do_upload = not no_crop and not no_upload and settings.use_minio_upload
 
-    if not no_crop and not no_vlm and settings.use_vlm_verification:
-        click.echo(f"\n[7/{total_stages}] VLM Verify (Qwen3-VL, lazy)...")
-        from src.services.vlm_verifier import verify_exam
-        from src.schemas.exam import QuestionType
-
-        # Snapshot trước VLM để so sánh
-        pre_vlm_n_answers = {q.number: len(q.answers) for q in exam.questions}
-        pre_vlm_n_unknown = sum(1 for q in exam.questions if q.type == QuestionType.UNKNOWN)
-        pre_vlm_n_review = sum(1 for q in exam.questions if q.needs_review)
-
+    if do_upload:
+        click.echo(f"\n[7/{total_stages}] Upload MinIO "
+                    f"(bucket={settings.minio_bucket} @ {settings.minio_endpoint})...")
+        from src.services.uploader import upload_exam_assets, upload_raw_file
+        from src.services.minio_client import MinIOService
         t0 = time.time()
         try:
-            n_vlm_calls = verify_exam(exam, layouts, group_layouts, images, out)
+            svc = MinIOService()
+            # File gốc (PDF) — set source_minio_key/url vào exam TRƯỚC khi ghi exam.json
+            if settings.minio_save_raw:
+                raw_info = upload_raw_file(input_path, exam, exam_id=exam_id, svc=svc)
+            # Crop + exam.json
+            n_uploaded = upload_exam_assets(exam, out, exam_id=exam_id, svc=svc)
+            up_elapsed = time.time() - t0
+            click.echo(f"   ✓ Uploaded {n_uploaded} ảnh"
+                        f"{' + file gốc' if raw_info else ''} + exam.json ({up_elapsed:.1f}s)")
         except Exception as e:
-            logger.error(f"VLM Verify failed: {e}")
-            click.echo(f"   ⚠ VLM failed: {e}")
-            n_vlm_calls = 0
-
-        vlm_elapsed = time.time() - t0
-        click.echo(f"   ✓ {n_vlm_calls} VLM calls ({vlm_elapsed:.1f}s)")
-
-        # So sánh trước/sau
-        post_vlm_n_unknown = sum(1 for q in exam.questions if q.type == QuestionType.UNKNOWN)
-        post_vlm_n_review = sum(1 for q in exam.questions if q.needs_review)
-        answers_added = sum(
-            max(0, len(q.answers) - pre_vlm_n_answers.get(q.number, 0))
-            for q in exam.questions
-        )
-
-        vlm_stats_text = f"""
-[VLM — Phase 3]
-  VLM calls: {n_vlm_calls}
-  Time: {vlm_elapsed:.1f}s
-  Answers added by VLM: {answers_added}
-  Type UNKNOWN: {pre_vlm_n_unknown} → {post_vlm_n_unknown}
-  Needs review: {pre_vlm_n_review} → {post_vlm_n_review}
+            logger.error(f"MinIO upload failed: {e}")
+            click.echo(f"   ⚠ MinIO upload failed: {e} — giữ URL local")
+        minio_stats_text = f"""
+[MinIO — Phase 4]
+  Endpoint: {settings.minio_endpoint}
+  Bucket: {settings.minio_bucket}
+  Key prefix: {settings.minio_prefix or '(none)'}{exam_id}/
+  File gốc: {raw_info['minio_key'] if raw_info else '(không upload)'}
+  Ảnh uploaded: {n_uploaded}
+  Presigned TTL: {settings.minio_presign_days} ngày
 """
-        click.echo(vlm_stats_text)
     else:
         reason = "SKIPPED"
         if no_crop:
             reason += " (--no-crop)"
-        if no_vlm:
-            reason += " (--no-vlm)"
-        if not settings.use_vlm_verification:
-            reason += " (use_vlm_verification=False)"
-        click.echo(f"\n[7/{total_stages}] VLM Verify — {reason}")
+        if no_upload:
+            reason += " (--no-upload)"
+        if not settings.use_minio_upload:
+            reason += " (use_minio_upload=False)"
+        click.echo(f"\n[7/{total_stages}] Upload MinIO — {reason}")
 
     # ============================================================
-    # Save exam.json
+    # Stage: Output JSON (Phase 5) — exam.json là cấu trúc cuối (chứa link MinIO nếu có)
     # ============================================================
     exam_json = exam.model_dump_json(indent=2)
     (out / "exam.json").write_text(exam_json, encoding="utf-8")
-    click.echo(f"\n✓ Saved exam.json")
+    click.echo(f"\n✓ Saved exam.json ({len(exam.questions)} câu, {len(exam.groups)} nhóm)")
+
+    # ============================================================
+    # Stage 8: Lưu lịch sử MongoDB (1 đề = 1 bản ghi)
+    # ============================================================
+    mongo_stats_text = ""
+    if settings.use_mongo:
+        click.echo(f"\n[8/{total_stages}] Lưu lịch sử MongoDB "
+                    f"({settings.mongo_db}.{settings.mongo_collection})...")
+        try:
+            from src.services.mongo_client import MongoService
+            mongo = MongoService()
+            mongo.save_exam(exam, raw=raw_info)
+            click.echo(f"   ✓ Lưu bản ghi exam {exam_id}")
+            mongo_stats_text = f"""
+[MongoDB — lịch sử]
+  URI: {settings.mongo_uri}
+  Collection: {settings.mongo_db}.{settings.mongo_collection}
+  _id: {exam_id}
+  File gốc: {raw_info['minio_key'] if raw_info else '(không lưu raw)'}
+"""
+        except Exception as e:
+            logger.error(f"Mongo save failed: {e}")
+            click.echo(f"   ⚠ Mongo save failed: {e}")
+    else:
+        click.echo(f"\n[8/{total_stages}] MongoDB — SKIPPED (use_mongo=False)")
 
     # ============================================================
     # Summary
@@ -354,15 +374,13 @@ Anchors by type:
   Overlay pages: {n_overlay}
 """
 
-    # VLM stats
-    if vlm_stats_text:
-        summary += vlm_stats_text
+    # MinIO upload stats (Phase 4)
+    if minio_stats_text:
+        summary += minio_stats_text
 
-    # Final type distribution (after VLM)
-    if n_vlm_calls > 0:
-        summary += "\n[Question Types — Final (after VLM)]\n"
-        for t_name, n in type_counter_final.most_common():
-            summary += f"    {t_name}: {n}\n"
+    # MongoDB stats
+    if mongo_stats_text:
+        summary += mongo_stats_text
 
     # Metadata
     summary += f"""

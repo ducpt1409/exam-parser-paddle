@@ -6,6 +6,76 @@ Format: `[Phase X.Y] - YYYY-MM-DD - Title`
 
 ---
 
+## [Phase 4.1] - 2026-06-06 - Lưu lịch sử MongoDB + file gốc lên MinIO
+
+### Mục đích
+Mỗi đề upload = 1 bản ghi lịch sử trong MongoDB (chuẩn bị code BE). Lưu cả file gốc (PDF)
+lên MinIO; bản ghi chứa output trích xuất + đường dẫn MinIO của file gốc & ảnh crop.
+
+### Giải pháp
+- **`src/core/config.py`**: thêm `use_mongo`, `mongo_uri`, `mongo_db`, `mongo_collection`,
+  `minio_save_raw`.
+- **`src/schemas/exam.py`**: thêm `source_minio_key`, `source_url` (file gốc trên MinIO).
+- **`src/schemas/record.py`** (MỚI): `RawFile`, `ExamRecord` (1 document Mongo) +
+  `from_exam()` / `to_mongo_doc()` (`_id` = exam_id). `output` = full Exam đã trích xuất.
+- **`src/services/uploader.py`**: thêm `upload_raw_file()` — upload PDF gốc lên
+  `{exam_id}/raw/{filename}`, set `source_minio_key`/`source_url`.
+- **`src/services/mongo_client.py`** (MỚI): `MongoService` — `save_exam()` (upsert theo _id),
+  `get_exam()`, `list_exams()` (bỏ output cho nhẹ), `ping()`.
+- **`scripts/parse_cli.py`**: Stage [7] thêm upload file gốc; Stage [8] lưu MongoDB.
+- **`src/services/pipeline.py`**: thêm upload raw + Mongo save vào `ExamPipeline` (`do_mongo`).
+- **`requirements.txt`**: `pymongo>=4.6.0`.
+- **`.env.example`** + **`SETUP.md` §11 (MongoDB Docker)**: hướng dẫn cài Mongo qua Docker
+  (+ Mongo Express UI tuỳ chọn), biến môi trường, cấu trúc bản ghi. Dời §11→12, 12→13, 13→14, 14→15.
+
+### Cấu trúc bản ghi (collection `exams`)
+`{ _id=exam_id, source_file, status, created_at, n_pages/n_questions/..., bucket,
+   minio_prefix, raw{filename,minio_key,url,size_bytes}, metadata{}, output{full Exam} }`
+
+### Lưu ý
+- `output` lưu cả presigned `url` (TTL 7 ngày sẽ hết hạn) — nhưng `minio_key` vĩnh viễn,
+  BE nên regenerate presigned từ key khi serve. raw.minio_key cũng vĩnh viễn.
+- Mongo/MinIO đều fail-safe: lỗi → log, không chặn pipeline (vẫn có exam.json local).
+
+---
+
+## [Phase 4+5] - 2026-06-06 - Bỏ VLM, upload MinIO + xuất JSON cấu trúc
+
+### Mục đích
+VLM (Phase 3) chạy không ổn (có lúc không gọi được, quá nhanh → nghi sai). Theo yêu cầu:
+TẮT VLM, chốt luồng Paddle + Snake → cắt hình → upload MinIO → trả JSON cấu trúc đã cắt.
+
+### Giải pháp
+- **`src/core/config.py`**: `use_vlm_verification=False`, `use_vlm_type_classify=False` (tắt mặc định).
+  Thêm `use_minio_upload=True`, `minio_presign_days=7`, `minio_prefix=""`.
+- **`src/services/minio_client.py`** (Phase 4, thay placeholder): `MinIOService` —
+  `ensure_bucket`, `upload_file`, `upload_bytes`, `upload_json`, `presigned_url` (TTL ngày), `public_url`.
+- **`src/services/uploader.py`** (MỚI): `upload_exam_assets(exam, out_dir)` — duyệt mọi
+  CroppedImage (full/content/đáp án/group header/passage), upload PNG local lên MinIO theo key
+  `{prefix}{exam_id}/crops/...`, rồi GHI ĐÈ `minio_key` + `url`(presigned) vào object. Upload luôn
+  exam.json. Chống upload trùng (passage≡header) bằng set id(); idempotent (skip nếu đã có minio_key);
+  fail-safe từng ảnh.
+- **`scripts/parse_cli.py`**: bỏ Stage VLM; thêm Stage [7] Upload MinIO (cờ `--no-upload`);
+  exam.json ghi SAU upload nên chứa link MinIO. `--no-vlm` giữ lại (deprecated, no-op).
+- **`src/services/pipeline.py`** (Phase 5, thay placeholder): `ExamPipeline.parse()` /
+  `.parse_to_json()` — entry lập trình/API chạy full luồng, trả Exam hoặc chuỗi JSON cấu trúc đã cắt.
+
+### Output cuối (Phase 5)
+`exam.json` = cấu trúc Exam: questions[] (full_image/content_image/answers[].image với
+`minio_key` + presigned `url`), groups[] (header/passage image). Đây là JSON trả về.
+MinIO chứa: `{bucket}/{exam_id}/crops/*.png` + `{exam_id}/exam.json`.
+
+### Cần làm khi chạy WSL
+- Cấu hình `.env`: `MINIO_ENDPOINT`, `MINIO_ACCESS_KEY`, `MINIO_SECRET_KEY`, `MINIO_BUCKET`.
+- `python scripts/parse_cli.py input/de.pdf` → kiểm tra log `[7/7] Upload MinIO ... Uploaded N ảnh`.
+- Mở exam.json xem `url` đã là presigned MinIO link chưa. `--no-upload` nếu chỉ test crop local.
+
+### Còn lại
+- VLM/re-slice (Phase 3.x) vẫn còn trong code, bật lại bằng `use_vlm_verification=True` nếu cần.
+- Chưa làm API FastAPI endpoint (dùng `ExamPipeline` là đủ để wrap sau).
+
+---
+
 ## [Phase 3.4] - 2026-06-05 - Re-slice đáp án MCQ theo khoảng trắng + bỏ fallback nới mù
 
 ### Mục đích

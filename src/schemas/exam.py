@@ -107,6 +107,8 @@ class Exam(BaseModel):
 
     # MinIO assets
     preview_pdf_url: Optional[str] = None    # PDF với bbox màu cho review
+    source_minio_key: Optional[str] = None   # key file gốc (PDF) trên MinIO
+    source_url: Optional[str] = None         # presigned URL file gốc
 
     # Stats
     n_questions: int = 0

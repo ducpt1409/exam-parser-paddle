@@ -15,10 +15,11 @@
 | 3 | PyTorch CUDA 12.8 | Cho VLM (Ollama) + utils | ✅ Bắt buộc |
 | 4 | PaddlePaddle **CPU** | Backend cho PaddleOCR (Blackwell chưa GPU support) | ✅ Bắt buộc |
 | 5 | PaddleOCR | Layout + OCR (CPU mode) | ✅ Bắt buộc |
-| 6 | Ollama + Qwen3-VL-32B | Semantic VLM | ✅ Bắt buộc |
-| 7 | MinIO (Docker) | Object storage | ✅ Bắt buộc |
-| 8 | PyMuPDF, Pillow, OpenCV | PDF/image processing | ✅ Auto cài qua pip |
-| 9 | FastAPI, uvicorn | API service | ✅ Auto cài qua pip |
+| 6 | Ollama + Qwen3-VL-32B | Semantic VLM (Phase 3, hiện TẮT) | ⚠️ Tuỳ chọn |
+| 7 | MinIO (Docker) | Object storage (crop + file gốc) | ✅ Bắt buộc |
+| 8 | MongoDB (Docker) | Lịch sử đề thi (1 đề = 1 bản ghi) | ✅ Bắt buộc |
+| 9 | PyMuPDF, Pillow, OpenCV | PDF/image processing | ✅ Auto cài qua pip |
+| 10 | FastAPI, uvicorn | API service | ✅ Auto cài qua pip |
 
 ---
 
@@ -350,7 +351,7 @@ exit   # thoát container
 
 ### 10.5 Lưu credentials vào `.env`
 
-Lưu vào file `.env` (sẽ tạo chi tiết ở §12):
+Lưu vào file `.env` (sẽ tạo chi tiết ở §13):
 ```bash
 MINIO_ACCESS_KEY=<paste Access Key>
 MINIO_SECRET_KEY=<paste Secret Key>
@@ -365,7 +366,99 @@ MINIO_SECRET_KEY=admin12345
 
 ---
 
-## 11. Cài Python packages của project
+## 11. MongoDB (Docker)
+
+Lưu lịch sử trích xuất: **mỗi đề thi = 1 bản ghi** trong collection `exams`. Bản ghi gồm
+metadata + `output` (toàn bộ cấu trúc đã cắt) + đường dẫn MinIO của file gốc & ảnh crop.
+
+### 11.1 Chạy MongoDB container
+
+```bash
+mkdir -p ~/mongo-data
+
+docker run -d \
+  --name mongo \
+  --restart unless-stopped \
+  -p 27017:27017 \
+  -v ~/mongo-data:/data/db \
+  -e MONGO_INITDB_ROOT_USERNAME=admin \
+  -e MONGO_INITDB_ROOT_PASSWORD=admin12345 \
+  mongo:7
+
+# Verify
+docker ps | grep mongo
+docker exec -it mongo mongosh -u admin -p admin12345 --eval "db.runCommand({ping:1})"
+# → { ok: 1 }
+```
+
+> **POC nhanh (không auth)**: bỏ 2 dòng `-e MONGO_INITDB_*` → URI là
+> `mongodb://localhost:27017`. Nếu bật auth như trên → URI có user/pass (xem 11.3).
+
+### 11.2 (Tuỳ chọn) Mongo Express — UI xem dữ liệu
+
+⚠️ Docker cài native trong WSL **KHÔNG có** `host.docker.internal` → phải cho mongo-express
+và mongo chung 1 network rồi gọi Mongo bằng TÊN CONTAINER (`mongo`):
+
+```bash
+# Tạo network + gắn container mongo (đang chạy) vào
+docker network create exam-net 2>/dev/null || true
+docker network connect exam-net mongo
+
+docker run -d --name mongo-express --restart unless-stopped \
+  --network exam-net \
+  -p 8081:8081 \
+  -e ME_CONFIG_MONGODB_URL="mongodb://admin:admin12345@mongo:27017/?authSource=admin" \
+  -e ME_CONFIG_BASICAUTH=false \
+  mongo-express
+
+docker ps | grep mongo-express      # phải Up (không Exited)
+# Mở http://localhost:8081
+```
+
+> Mongo chạy KHÔNG auth (bỏ `MONGO_INITDB_ROOT_*` ở 11.1) → dùng
+> `ME_CONFIG_MONGODB_URL="mongodb://mongo:27017"` (không cần user/pass/authSource).
+>
+> Nếu mongo-express **Exited**: `docker logs mongo-express` — thường là không resolve host
+> hoặc auth fail. Sửa theo 2 điểm trên.
+
+### 11.3 Cấu hình `.env`
+
+```bash
+USE_MONGO=true
+# Không auth (POC):
+MONGO_URI=mongodb://localhost:27017
+# Có auth (như 11.1):
+# MONGO_URI=mongodb://admin:admin12345@localhost:27017/?authSource=admin
+MONGO_DB=exam_parser
+MONGO_COLLECTION=exams
+```
+
+### 11.4 Cấu trúc 1 bản ghi (collection `exams`)
+
+```jsonc
+{
+  "_id": "920dc046",              // = exam_id
+  "source_file": "de_thi.pdf",
+  "status": "done",
+  "created_at": "2026-06-06T...Z",
+  "n_pages": 23, "n_questions": 50, "n_groups": 1, "n_mcq": 50, "n_essay": 0,
+  "bucket": "exam-parser",
+  "minio_prefix": "920dc046/",
+  "raw": {                         // file gốc đã lưu MinIO
+    "filename": "de_thi.pdf",
+    "minio_key": "920dc046/raw/de_thi.pdf",
+    "url": "https://.../presigned",
+    "size_bytes": 1234567,
+    "content_type": "application/pdf"
+  },
+  "metadata": { "ma_de": "...", "mon": "..." },
+  "output": { /* toàn bộ Exam: questions[], groups[] với minio_key+url mỗi ảnh */ }
+}
+```
+
+---
+
+## 12. Cài Python packages của project
 
 ```bash
 cd ~/exam_parser_paddle    # hoặc đường dẫn project
@@ -376,7 +469,7 @@ pip install -r requirements.txt
 
 ---
 
-## 12. Tạo file `.env`
+## 13. Tạo file `.env`
 
 ```bash
 cd ~/exam_parser_paddle
@@ -388,24 +481,28 @@ nano .env   # hoặc editor khác
 ```bash
 # MinIO
 MINIO_ENDPOINT=localhost:9000
-MINIO_ACCESS_KEY=<từ §10.3>
-MINIO_SECRET_KEY=<từ §10.3>
+MINIO_ACCESS_KEY=<từ §10.4>
+MINIO_SECRET_KEY=<từ §10.4>
 MINIO_BUCKET=exam-parser
 MINIO_SECURE=false
+MINIO_SAVE_RAW=true              # lưu cả file gốc PDF
+USE_MINIO_UPLOAD=true
 
-# Ollama
-OLLAMA_HOST=http://localhost:11434
-OLLAMA_VLM_MODEL=qwen3-vl:32b-instruct
+# MongoDB (lịch sử đề thi — §11)
+USE_MONGO=true
+MONGO_URI=mongodb://localhost:27017
+MONGO_DB=exam_parser
+MONGO_COLLECTION=exams
 
-# Pipeline
+# Pipeline (Phase 4/5: VLM tắt mặc định)
 DEFAULT_DPI=300
-USE_VLM_VERIFICATION=true
+USE_VLM_VERIFICATION=false
 LOG_LEVEL=INFO
 ```
 
 ---
 
-## 13. Verify toàn bộ
+## 14. Verify toàn bộ
 
 Chạy script kiểm tra:
 
@@ -436,7 +533,7 @@ Nếu có lỗi, xem §14 troubleshooting.
 
 ---
 
-## 14. Troubleshooting
+## 15. Troubleshooting
 
 ### 14.1 PyTorch không có sm_120 (RTX 5090)
 ```bash

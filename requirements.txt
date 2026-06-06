@@ -22,6 +22,7 @@ pydantic-settings>=2.0.0      # Settings management
 
 # === Storage ===
 minio>=7.2.0                  # MinIO SDK
+pymongo>=4.6.0                # MongoDB driver (lịch sử đề thi)
 
 # === Utilities ===
 click>=8.1.0                  # CLI
