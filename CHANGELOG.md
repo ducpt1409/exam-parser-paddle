@@ -6,6 +6,70 @@ Format: `[Phase X.Y] - YYYY-MM-DD - Title`
 
 ---
 
+## [Phase 3.4] - 2026-06-05 - Re-slice đáp án MCQ theo khoảng trắng + bỏ fallback nới mù
+
+### Mục đích
+Đề azota: per-answer crop hỏng — q1_B chỉ có chữ "B." (55px), q1_A/C/q2_B mất hẳn ảnh
+(VLM chỉ thêm text). Chất lượng ảnh đáp án chưa đảm bảo.
+
+### Vấn đề (phân tích output c939d5ba)
+1. **Crop đáp án dựa vào MARKER không đáng tin**: OCR toán tách "B." khỏi công thức →
+   region đáp án = mỗi chữ "B."; marker mất hẳn (A/C) → không có ảnh; VLM thêm text nhưng `image=None`.
+2. **Fallback nới dọc 12% (3.3) nuốt chỉ dẫn trang 1**: q1 là câu ĐẦU trang, không có
+   hàng xóm trên → fallback kéo lên 396px, ôm trọn 3 dòng đỏ "Phần đáp án/lời giải/Kéo đề thi...".
+
+### Giải pháp (`src/services/vlm_verifier.py`)
+1. **`_reslice_row_answers()` — chia cột theo KHOẢNG TRẮNG** (không dựa marker):
+   - Band đáp án = vùng full (đã nới dọc) dưới stem, mép trên chừa 1.5 line cho tử số/mũ.
+   - Chiếu band lên trục x → tìm cột trắng (ink==0) = khe giữa đáp án.
+   - Lấy N-1 khe RỘNG NHẤT (N = số đáp án VLM xác nhận) làm ranh giới → crop N cột.
+   - Gán mỗi cột cho 1 đáp án (nhãn A→D ↔ trái→phải). Bắt được cả đáp án OCR bỏ sót.
+   - Chỉ áp dụng layout 1 HÀNG (marker cùng mức y); lưới 2x2 → bỏ qua, giữ nguyên.
+   - Gọi cho MCQ khi `answers_added>0` hoặc có đáp án `image=None`. 2x2/không tách được → no-op.
+2. **Bỏ fallback nới dọc 12%**: không có hàng xóm hướng nào → GIỮ NGUYÊN biên hướng đó
+   (chỉ nới tới câu hàng xóm thật). Hết nuốt header/chỉ dẫn.
+
+### Kết quả (prototype gap-detection trên ảnh thật)
+- q1 → 4 cột x=[0,709][709,1199][1199,1825][1825,2550] — khớp đúng A/B/C/D ✓
+- q2 → 4 cột x=[0,633][633,1208][1208,1783][1783,2550] — tách đúng cả B bị thiếu ✓
+- Stat mới trong log: `re-slice đáp án`.
+
+### Còn lại / lưu ý
+- Layout đáp án 2x2 (lưới) chưa re-slice (giữ crop Phase 2) — hiếm ở đề này.
+- Cần CHẠY THẬT trên WSL (cần numpy) để xác nhận; máy Mac không chạy được Paddle/numpy stack.
+- Đề Tiếng Anh/Toán 8: re-slice chỉ chạy trên câu MCQ bị flag — verify không hồi quy.
+
+---
+
+## [Phase 3.3.1] - 2026-06-05 - Sửa re-crop nới lên NUỐT câu trước (band tìm hàng xóm sai)
+
+### Mục đích
+Sau 3.3, chạy thật (output c939d5ba): re-crops=17 (đã kích hoạt), nhưng `q29_full.png`
+chứa CẢ Câu 28 lẫn Câu 29 → ảnh xấu hơn, người dùng tưởng "không cải thiện".
+
+### Vấn đề
+`_recrop_fullwidth` tìm hàng xóm trên bằng lọc `bottom <= y_top`. Nhưng Phase 2 hay cho
+vùng các câu CHỒNG LẤN nhau (Câu 28: 479-945 thò xuống qua đỉnh Câu 29: 913). Vì 945 > 913
+nên Câu 28 bị loại khỏi "câu ở trên" → thuật toán nhảy lên câu xa (đáy ~465) → nuốt trọn Câu 28.
+
+### Giải pháp (`src/services/vlm_verifier.py`)
+Đổi tiêu chí hàng xóm sang VỊ TRÍ TƯƠNG ĐỐI của ĐỈNH (y_top), chịu được chồng lấn:
+- `above = [b for (a,b) if a < y1]` → sàn = max(above). Nếu câu trên chồng xuống quá y1
+  thì sàn > y1 → `min(.., y1)` ép new_y1=y1 ⇒ KHÔNG nới lên (không nuốt câu trên).
+- `below = [a for (a,b) if b > y2]` → trần = min(below) (đối xứng cho mép dưới).
+
+### Kết quả (simulate trên bố cục trang 4 có chồng lấn)
+- Câu 29: 913-1186 → 913-1225 (up=0 ✓ không nuốt Câu 28, down=+ bắt trọn đáp án).
+- Câu 31/34 (kẹp giữa câu chồng lấn): không nới — an toàn.
+
+### Lưu ý quan trọng cho người dùng
+Với MCQ toán: ảnh crop CŨ **đã chứa đủ 4 đáp án về mặt pixel** — OCR chỉ không ĐỌC được
+công thức. Nên re-crop to hơn KHÔNG đổi nhiều về thị giác; giá trị thật là **text đáp án
+được khôi phục trong `exam.json`** (q3 thêm C, q13 thêm A...). Re-crop chỉ tạo khác biệt
+thị giác khi nội dung bị cắt vật lý (hiếm ở đề này). → Kiểm tra exam.json, đừng chỉ nhìn ảnh.
+
+---
+
 ## [Phase 3.3] - 2026-06-05 - Sửa re-crop VLM không bao giờ kích hoạt (ảnh crop không đổi)
 
 ### Mục đích

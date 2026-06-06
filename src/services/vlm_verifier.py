@@ -203,7 +203,8 @@ def _recrop_fullwidth(
     cắt THEO CHIỀU DỌC. Chỉ mở chiều ngang (bản cũ) không cứu được. Ở đây ta nới:
       - mép trên LÊN tới đáy câu liền trước trên cùng trang (max bottom của vùng nằm trên).
       - mép dưới XUỐNG tới đỉnh câu liền sau trên cùng trang (min top của vùng nằm dưới).
-    Nếu không có hàng xóm trên trang → nới một biên an toàn (12% chiều cao trang).
+    KHÔNG có hàng xóm theo hướng nào → GIỮ NGUYÊN biên hướng đó (không fallback nới mù):
+    fallback cũ (12% chiều cao trang) nuốt phải header/chỉ dẫn nằm trên câu đầu trang.
 
     Dùng lại hàm crop của Phase 2 (cropper module).
     """
@@ -214,7 +215,6 @@ def _recrop_fullwidth(
         return
 
     GAP = 4.0           # chừa vài px để không nuốt chữ của câu hàng xóm
-    FALLBACK = 0.12     # không có hàng xóm → nới 12% chiều cao trang
 
     new_parts: list[Region] = []
     for part in layout.full.parts:
@@ -223,15 +223,21 @@ def _recrop_fullwidth(
         x1, y1, x2, y2 = part.bbox
 
         others = regions_by_page.get(part.page_index, [])
-        # Đáy của các vùng nằm HẲN trên câu này (b <= y1) → trần để nới lên.
-        ups = [b for (a, b) in others if b <= y1 + 1.0]
-        # Đỉnh của các vùng nằm HẲN dưới câu này (a >= y2) → sàn để nới xuống.
-        downs = [a for (a, b) in others if a >= y2 - 1.0]
+        # Hàng xóm xác định theo VỊ TRÍ TƯƠNG ĐỐI của ĐỈNH (y_top), KHÔNG theo đáy —
+        # vì Phase 2 hay cho vùng các câu CHỒNG LẤN nhau (đáy câu trên thò qua đỉnh câu
+        # dưới). Nếu lọc theo đáy thì câu kề bị loại, thuật toán nhảy lên câu xa → nuốt câu.
+        #
+        # above = đáy của mọi vùng có ĐỈNH nằm trên đỉnh câu này (loại trừ chính nó).
+        #   Lấy đáy THẤP NHẤT làm sàn. Nếu câu trên chồng xuống quá y1 → sàn > y1
+        #   ⇒ min(...,y1) ép new_y1=y1 ⇒ KHÔNG nới lên (an toàn, không nuốt câu trên).
+        above = [b for (a, b) in others if a < y1 - 1.0]
+        # below = đỉnh của mọi vùng có ĐÁY nằm dưới đáy câu này → trần để nới xuống.
+        below = [a for (a, b) in others if b > y2 + 1.0]
 
-        new_y1 = (max(ups) + GAP) if ups else (y1 - FALLBACK * ph)
-        new_y2 = (min(downs) - GAP) if downs else (y2 + FALLBACK * ph)
+        new_y1 = (max(above) + GAP) if above else y1
+        new_y2 = (min(below) - GAP) if below else y2
 
-        # Không bao giờ thu hẹp so với vùng gốc; kẹp trong trang.
+        # Chỉ NỚI RỘNG, không bao giờ thu hẹp; kẹp trong trang.
         new_y1 = max(0.0, min(new_y1, y1))
         new_y2 = min(ph, max(new_y2, y2))
 
@@ -252,6 +258,127 @@ def _recrop_fullwidth(
         # Cập nhật layout
         layout.full = new_region
         logger.info(f"q{q.number}: re-crop full-width → {new_image.width}x{new_image.height}")
+
+
+# ============================================================
+# Re-slice đáp án MCQ 1 hàng ngang (gap-detection)
+# ============================================================
+
+def _reslice_row_answers(
+    q: Question,
+    layout: QuestionLayout,
+    images: list[Image.Image],
+    out_dir: Path,
+    page_widths: list[float],
+) -> bool:
+    """Cắt lại ảnh từng đáp án cho MCQ xếp 1 HÀNG NGANG bằng chia cột theo KHOẢNG TRẮNG.
+
+    Vì sao cần: OCR đề toán tách rời marker ("B.") khỏi công thức → crop đáp án Phase 2
+    chỉ còn mỗi chữ "B." (55px), hoặc marker mất hẳn (A/C) → không có ảnh. Dựa vào MARKER
+    để cắt là không đáng tin. Thay vào đó:
+      1. Xác định BAND đáp án (y từ hàng marker → đáy vùng câu) và trang chứa.
+      2. Chiếu band lên trục x, tìm các CỘT TRẮNG (ink == 0) = khe giữa các đáp án.
+      3. Lấy N-1 khe RỘNG NHẤT (N = số đáp án VLM xác nhận) làm ranh giới cột.
+      4. Crop mỗi cột → 1 đáp án (đầy đủ công thức), kể cả đáp án OCR bỏ sót.
+
+    Chỉ áp dụng cho layout 1 HÀNG (marker cùng mức y). Lưới 2x2 → trả False (giữ nguyên).
+
+    Returns: True nếu đã cắt lại, False nếu bỏ qua (không đủ điều kiện / không tách được).
+    """
+    try:
+        import numpy as np
+    except ImportError:
+        logger.warning("numpy không có → bỏ qua re-slice đáp án")
+        return False
+    from collections import Counter
+
+    from src.services.cropper import _make_cropped_image
+
+    if not layout or not layout.answers:
+        return False
+
+    # Marker đã detect (kể cả bare marker) — đáng tin về VỊ TRÍ, không tin về NỘI DUNG.
+    marks = [
+        (lbl, mreg.parts[0].page_index, mreg.parts[0].bbox)
+        for lbl, mreg in layout.answers if mreg.parts
+    ]
+    if len(marks) < 2:
+        return False
+
+    page = Counter(pi for _, pi, _ in marks).most_common(1)[0][0]
+    pm = [b for _, pi, b in marks if pi == page]
+    ytops = [b[1] for b in pm]
+    ybots = [b[3] for b in pm]
+    heights = sorted(b[3] - b[1] for b in pm)
+    med_h = heights[len(heights) // 2] or 30.0
+
+    # Chỉ xử lý 1 HÀNG: các marker phải nằm cùng mức y (chênh ≤ 2 line-height).
+    if (max(ybots) - min(ytops)) > 2.0 * med_h:
+        return False
+
+    N = len(q.answers)
+    if N < 2 or page >= len(images):
+        return False
+
+    # Band đáp án bị kẹp trong VÙNG FULL của câu (đã re-crop nới dọc) để không lấn câu kế;
+    # mép trên chừa 1.5 line phía trên marker để KHÔNG cắt tử số phân số / mũ nằm cao hơn.
+    full_pg = [p.bbox for p in layout.full.parts if p.page_index == page]
+    full_top = min(b[1] for b in full_pg) if full_pg else 0.0
+    full_bot = max(b[3] for b in full_pg) if full_pg else float(images[page].height)
+    band_y0 = max(full_top, min(ytops) - 1.5 * med_h)
+    band_y1 = full_bot
+
+    arr = np.asarray(images[page].convert("L"))
+    H, W = arr.shape
+    y0i, y1i = int(band_y0), int(min(band_y1, H))
+    if y1i - y0i < 5:
+        return False
+
+    ink = (arr[y0i:y1i, :] < 128).sum(axis=0)  # số pixel mực mỗi cột
+    empty = ink == 0
+
+    # Gom các run cột trắng (gap)
+    gaps: list[tuple[int, int]] = []
+    i = 0
+    while i < W:
+        if empty[i]:
+            j = i
+            while j < W and empty[j]:
+                j += 1
+            gaps.append((i, j))
+            i = j
+        else:
+            i += 1
+
+    internal = [(a, b) for (a, b) in gaps if a > 0 and b < W]
+    if len(internal) < N - 1:
+        return False  # không tách đủ N cột → giữ nguyên
+
+    # N-1 khe rộng nhất → ranh giới cột (giữa khe)
+    internal.sort(key=lambda g: -(g[1] - g[0]))
+    chosen = sorted(internal[: N - 1])
+    bounds = [0] + [(a + b) // 2 for (a, b) in chosen] + [W]
+    cols = [(bounds[k], bounds[k + 1]) for k in range(N)]
+
+    # Crop từng cột → gán cho đáp án theo thứ tự nhãn (đã sort A,B,C,D ↔ trái→phải)
+    q.answers.sort(key=lambda a: a.label.upper())
+    crops_dir = out_dir / "crops"
+    pw = page_widths[page] if page < len(page_widths) else float(W)
+    for k, ans in enumerate(q.answers):
+        cx0, cx1 = cols[k]
+        cx1 = min(float(cx1), pw)
+        region = MultiRegion(parts=[Region(
+            page_index=page, bbox=(float(cx0), band_y0, float(cx1), band_y1)
+        )])
+        path = crops_dir / f"q{q.number}_{ans.label}.png"
+        ci = _make_cropped_image(
+            region, images, path, f"crops/q{q.number}_{ans.label}.png"
+        )
+        if ci:
+            ans.image = ci
+
+    logger.info(f"q{q.number}: re-slice {N} đáp án theo cột (band y={y0i}-{y1i})")
+    return True
 
 
 # ============================================================
@@ -311,6 +438,7 @@ def verify_exam(
         "answers_added": 0,
         "type_changed": 0,
         "recrop": 0,
+        "reslice": 0,
         "review_cleared": 0,
         "errors": 0,
     }
@@ -355,7 +483,7 @@ def verify_exam(
                     if stats["review_cleared"]:
                         total_stats["review_cleared"] += 1
 
-                    # Re-crop nếu cần
+                    # Re-crop full nếu cần (mở band dọc)
                     if stats["recrop_needed"]:
                         try:
                             _recrop_fullwidth(q, layouts, regions_by_page, images,
@@ -363,6 +491,25 @@ def verify_exam(
                             total_stats["recrop"] += 1
                         except Exception as e:
                             logger.error(f"q{q.number}: lỗi re-crop — {e}")
+
+                    # Re-slice đáp án cho MCQ 1 hàng (sau re-crop để dùng band full đã nới).
+                    # Chạy khi crop đáp án Phase 2 không đáng tin: có đáp án thiếu ảnh
+                    # (VLM thêm text) HOẶC vừa bổ sung đáp án. Layout 2x2 sẽ tự bỏ qua.
+                    if q.type in (QuestionType.MCQ_SINGLE, QuestionType.MCQ_MULTI,
+                                   QuestionType.READING_COMPREHENSION):
+                        need_reslice = (
+                            stats["answers_added"] > 0
+                            or any(a.image is None for a in q.answers)
+                        )
+                        if need_reslice and len(q.answers) >= 2:
+                            try:
+                                layout = layouts.get(q.id)
+                                if layout and _reslice_row_answers(
+                                    q, layout, images, out_dir, page_widths
+                                ):
+                                    total_stats["reslice"] += 1
+                            except Exception as e:
+                                logger.error(f"q{q.number}: lỗi re-slice đáp án — {e}")
 
                 except Exception as e:
                     logger.error(f"q{q.number}: VLM exception — {e}")
@@ -399,13 +546,14 @@ def verify_exam(
         f"+{total_stats['answers_added']} answers, "
         f"{total_stats['type_changed']} type changes, "
         f"{total_stats['recrop']} re-crops, "
+        f"{total_stats['reslice']} re-slice đáp án, "
         f"{total_stats['review_cleared']} reviews cleared, "
         f"{total_stats['errors']} errors"
     )
     vlm_log.info(
         f"SUMMARY: {n_calls} calls, +{total_stats['answers_added']} answers, "
         f"{total_stats['type_changed']} types, {total_stats['recrop']} re-crops, "
-        f"{total_stats['errors']} errors"
+        f"{total_stats['reslice']} re-slice, {total_stats['errors']} errors"
     )
 
     return n_calls
