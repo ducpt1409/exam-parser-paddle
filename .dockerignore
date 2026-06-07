@@ -1,0 +1,19 @@
+# Không đưa vào image
+.env
+.git
+.gitignore
+__pycache__/
+*.pyc
+*.pyo
+.DS_Store
+output/
+input/
+logs/
+tests/
+*.md
+PHASE3_GUIDE.md
+notes/
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/

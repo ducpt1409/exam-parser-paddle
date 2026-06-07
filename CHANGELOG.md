@@ -6,6 +6,59 @@ Format: `[Phase X.Y] - YYYY-MM-DD - Title`
 
 ---
 
+## [Phase 6.1] - 2026-06-07 - Tách hạ tầng (MinIO + Mongo) ra stack riêng
+
+### Mục đích
+`docker-compose.yml` của AI service chỉ nên chứa service xử lý. MinIO + MongoDB chuyển sang
+stack hạ tầng riêng để tái dùng cho cả BE/FE và quản lý data độc lập.
+
+### Giải pháp
+- **`exam_parser_infra/`** (MỚI): `docker-compose.yml` (minio + minio-init + mongo +
+  mongo-express) + `.env.example` + `README.md`. Chạy stack này TRƯỚC.
+- **`exam_parser_paddle/docker-compose.yml`**: gỡ minio/minio-init/mongo/mongo-express,
+  CHỈ còn `ai-service`. Kết nối hạ tầng qua `host.docker.internal:9000` / `:27017`
+  (+ `extra_hosts: host-gateway` cho WSL). Giữ volume cache model Paddle.
+- **`.env.docker.example`** + **`README_DOCKER.md`**: cập nhật theo kiến trúc 2 stack.
+
+---
+
+## [Phase 6] - 2026-06-07 - Đóng gói thành AI Service (1 API) + Docker
+
+### Mục đích
+Biến pipeline thành 1 AI service có đúng 1 endpoint xử lý: nhận file đề thi → chạy y hệt
+CLI (Paddle + Snake → cắt ảnh + overlay) nhưng KHÔNG giữ file local, đẩy hết lên MinIO
+(thêm cả folder `overlay/`) + lưu Mongo. API chỉ trả trạng thái + exam_id; lỗi stage nào
+trả đúng mã lỗi của stage đó. Đóng gói Docker để build lại/chạy lại khi cần. CLI giữ nguyên.
+
+### Giải pháp
+- **`src/core/errors.py`** (MỚI): bảng mã lỗi theo stage (`E101..E108`, input `E400/E415/E422`,
+  `E500`) + `PipelineStageError` (mang `code`/`stage`/`http_status`/`detail` → `to_response()`).
+- **`src/schemas/exam.py`**: thêm `OverlayImage` + field `Exam.overlay` (ảnh overlay trên MinIO).
+- **`src/services/uploader.py`**: thêm `upload_overlay()` — upload `overlay/page_*.png` lên
+  `{exam_id}/overlay/` và ghi vào `exam.overlay`.
+- **`src/services/pipeline.py`**: tách lõi `_run_stages()`; thêm `run()` cho API (thư mục TẠM,
+  bọc mỗi stage → raise `PipelineStageError`, upload raw+overlay+crops+exam.json, lưu Mongo,
+  rồi xoá thư mục tạm). `parse()` cũ giữ hành vi ghi `./output` cho debug.
+- **`src/api/schemas.py`** (MỚI): `ParseSuccess`, `ParseError`, `HealthResponse`.
+- **`src/api/routers/exams.py`** (MỚI): `POST /api/v1/exams/parse` (multipart) — validate,
+  lưu tạm, chạy `ExamPipeline().run()`, trả 200/`done` hoặc body lỗi + HTTP theo mã.
+- **`src/api/main.py`**: CORS + mount router + `/api/v1/health`.
+- **`Dockerfile`** (MỚI): python:3.11-slim + paddlepaddle 3.0.0 CPU + requirements; healthcheck.
+- **`docker-compose.yml`** (VIẾT LẠI): stack riêng AI service — `ai-service` + `minio` +
+  `minio-init` + `mongo` + `mongo-express` (gọi nhau qua tên service, có volume cache model).
+- **`.dockerignore`**, **`.env.docker.example`**, **`README_DOCKER.md`** (MỚI).
+
+### Kết quả
+`docker compose build ai-service && docker compose up -d` → `POST /api/v1/exams/parse` trả
+`{status, exam_id, ...}`; kết quả nằm ở `{bucket}/{prefix}{exam_id}/{raw,crops,overlay,exam.json}`
++ 1 document Mongo. CLI debug không đổi.
+
+### Còn lại
+- Presigned URL ký theo `minio:9000` chỉ dùng trong network Docker (xem README_DOCKER §6).
+- BE riêng (`exam_parser_be`) gọi sang service này — theo guide trong thư mục đó.
+
+---
+
 ## [Phase 4.1] - 2026-06-06 - Lưu lịch sử MongoDB + file gốc lên MinIO
 
 ### Mục đích

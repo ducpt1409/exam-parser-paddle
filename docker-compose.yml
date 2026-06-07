@@ -1,48 +1,61 @@
-version: '3.8'
-
-# Docker Compose cho MinIO local storage
-# Ollama service được cài qua systemd (xem SETUP.md §9)
+# ============================================================
+# exam_parser_paddle — AI SERVICE (chỉ chứa service xử lý).
+#
+# Hạ tầng (MinIO + MongoDB) nằm ở stack RIÊNG: ../exam_parser_infra
+# → Chạy exam_parser_infra TRƯỚC, rồi mới chạy stack này.
+#
+# AI service kết nối hạ tầng qua host (host.docker.internal):
+#   MinIO : host.docker.internal:9000
+#   Mongo : host.docker.internal:27017
+#
+# Lệnh:
+#   docker compose build ai-service     # build lại image AI
+#   docker compose up -d                # chạy AI service
+#   docker compose logs -f ai-service   # xem log
+#   docker compose down                 # dừng
+# ============================================================
 
 services:
-  minio:
-    # Dùng Quay.io thay Docker Hub để tránh rate limit (100 pull/6h)
-    image: quay.io/minio/minio:latest
-    container_name: exam_parser_minio
+  ai-service:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: exam_parser_paddle:latest
+    container_name: exam_parser_ai
     restart: unless-stopped
     ports:
-      - "9000:9000"   # S3 API
-      - "9001:9001"   # Web Console
+      - "8000:8000"
+    environment:
+      # --- MinIO (hạ tầng ở stack exam_parser_infra, qua host) ---
+      MINIO_ENDPOINT: ${MINIO_ENDPOINT:-host.docker.internal:9000}
+      MINIO_ACCESS_KEY: ${MINIO_ROOT_USER:-admin}
+      MINIO_SECRET_KEY: ${MINIO_ROOT_PASSWORD:-admin12345}
+      MINIO_BUCKET: ${MINIO_BUCKET:-exam-parser}
+      MINIO_SECURE: "false"
+      MINIO_PREFIX: ${MINIO_PREFIX:-exams/}
+      MINIO_SAVE_RAW: "true"
+      MINIO_PRESIGN_DAYS: "7"
+      USE_MINIO_UPLOAD: "true"
+      # --- MongoDB (hạ tầng ở stack exam_parser_infra, qua host) ---
+      USE_MONGO: "true"
+      MONGO_URI: ${MONGO_URI:-mongodb://admin:admin12345@host.docker.internal:27017/?authSource=admin}
+      MONGO_DB: ${MONGO_DB:-exam_parser}
+      MONGO_COLLECTION: ${MONGO_COLLECTION:-exams}
+      # --- Pipeline ---
+      USE_VLM_VERIFICATION: "false"
+      PADDLE_USE_GPU: "false"
+      DEFAULT_DPI: "300"
+      TEMP_DIR: /tmp/exam_parser
+      LOG_LEVEL: INFO
+      CORS_ORIGINS: "*"
+    # WSL native Docker KHÔNG tự có host.docker.internal → ánh xạ tới host-gateway:
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     volumes:
-      - minio_data:/data
-    environment:
-      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-admin}
-      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-admin12345}
-    command: server /data --console-address ":9001"
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
-      interval: 30s
-      timeout: 20s
-      retries: 3
-
-  # Optional: bucket creator (chạy 1 lần để tạo bucket auto)
-  minio-init:
-    image: quay.io/minio/mc:latest
-    container_name: exam_parser_minio_init
-    depends_on:
-      minio:
-        condition: service_healthy
-    environment:
-      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-admin}
-      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-admin12345}
-    entrypoint: >
-      /bin/sh -c "
-      mc alias set local http://minio:9000 $$MINIO_ROOT_USER $$MINIO_ROOT_PASSWORD;
-      mc mb local/exam-parser --ignore-existing;
-      mc anonymous set download local/exam-parser;
-      echo 'Bucket exam-parser created and set to public download';
-      exit 0;
-      "
+      # Cache model Paddle để không tải lại mỗi lần rebuild
+      - paddle_models:/root/.paddleocr
+      - paddlex_models:/root/.paddlex
 
 volumes:
-  minio_data:
-    driver: local
+  paddle_models:
+  paddlex_models:

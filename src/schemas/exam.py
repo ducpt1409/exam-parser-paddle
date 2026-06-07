@@ -42,6 +42,13 @@ class CroppedImage(BaseModel):
     size_bytes: int
 
 
+class OverlayImage(BaseModel):
+    """Ảnh debug overlay 1 trang (bbox màu) đã upload MinIO."""
+    page_index: int
+    minio_key: str = ""
+    url: Optional[str] = None
+
+
 class Answer(BaseModel):
     """1 đáp án."""
     label: str                       # "A", "B", "C", "D"
@@ -109,6 +116,7 @@ class Exam(BaseModel):
     preview_pdf_url: Optional[str] = None    # PDF với bbox màu cho review
     source_minio_key: Optional[str] = None   # key file gốc (PDF) trên MinIO
     source_url: Optional[str] = None         # presigned URL file gốc
+    overlay: list["OverlayImage"] = Field(default_factory=list)  # ảnh debug overlay từng trang trên MinIO
 
     # Stats
     n_questions: int = 0

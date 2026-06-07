@@ -1,31 +1,31 @@
-"""Main pipeline orchestrator (Phase 4/5) — Paddle + Snake → Crop → MinIO → JSON.
+"""Main pipeline orchestrator — Paddle + Snake → Crop → MinIO → Mongo.
 
-Bản đồ hoá toàn bộ stage thành 1 entry lập trình (dùng cho API / batch). VLM (Phase 3)
-TẮT mặc định; bật lại bằng settings.use_vlm_verification nếu cần sau này.
+Hai chế độ:
+  * CLI (scripts/parse_cli.py): giữ nguyên, ghi mọi file ra ./output/{exam_id} để debug.
+  * API (AI service): gọi `ExamPipeline(...).run()` — KHÔNG giữ file local, cắt ảnh +
+    overlay vào thư mục tạm rồi đẩy hết lên MinIO, lưu lịch sử Mongo, cuối cùng XÓA
+    thư mục tạm. Lỗi ở stage nào → raise PipelineStageError(mã lỗi của stage đó).
 
-Luồng:
-    Preprocess → PaddleOCR → Anchor → Snake Walker → Classifier → Cropper
-              → (VLM nếu bật) → MinIO upload → Exam (JSON)
-
-API:
+API dùng:
     from src.services.pipeline import ExamPipeline
-    pipe = ExamPipeline()
-    exam = pipe.parse("input/de.pdf")          # Exam object (đã set minio url)
-    js   = pipe.parse_to_json("input/de.pdf")  # chuỗi JSON cấu trúc đã cắt
+    exam = ExamPipeline().run("de.pdf", exam_id="abc123")   # raise PipelineStageError nếu lỗi
 """
 from __future__ import annotations
 
+import shutil
+import tempfile
 from pathlib import Path
 from typing import Optional
 from uuid import uuid4
 
 from src.core.config import settings
+from src.core.errors import ErrorCodes, PipelineStageError
 from src.core.logging import logger
 from src.schemas.exam import Exam
 
 
 class ExamPipeline:
-    """Chạy full pipeline 1 đề thi và trả về Exam (kèm crop đã upload MinIO)."""
+    """Chạy full pipeline 1 đề thi và trả về Exam (kèm crop/overlay đã upload MinIO)."""
 
     def __init__(
         self,
@@ -43,47 +43,111 @@ class ExamPipeline:
         self.do_vlm = settings.use_vlm_verification if do_vlm is None else do_vlm
         self.do_mongo = settings.use_mongo if do_mongo is None else do_mongo
 
-    # ------------------------------------------------------------
+    # ============================================================
+    # API entry — không giữ file local, raise PipelineStageError theo stage
+    # ============================================================
+    def run(
+        self,
+        input_path: str | Path,
+        exam_id: Optional[str] = None,
+    ) -> Exam:
+        """Chạy pipeline cho AI service.
+
+        - Cắt ảnh + overlay vào thư mục TẠM, upload hết lên MinIO (raw + crops +
+          overlay + exam.json), lưu lịch sử Mongo, rồi XÓA thư mục tạm.
+        - Lỗi ở stage nào → raise PipelineStageError(spec của stage đó).
+
+        Trả về Exam (đã set minio_key/url cho mọi asset).
+        """
+        exam_id = exam_id or str(uuid4())[:8]
+        tmp_root = Path(settings.temp_dir)
+        tmp_root.mkdir(parents=True, exist_ok=True)
+        work = Path(tempfile.mkdtemp(prefix=f"{exam_id}_", dir=str(tmp_root)))
+        logger.info(f"[Pipeline.run] {input_path} (exam_id={exam_id}) work={work}")
+        try:
+            exam = self._run_stages(
+                input_path, exam_id, work,
+                cleanup_local=True, raise_on_stage_error=True,
+            )
+            return exam
+        finally:
+            shutil.rmtree(work, ignore_errors=True)
+
+    # ============================================================
+    # CLI-compatible entry — giữ file local (debug). Không raise theo stage.
+    # ============================================================
     def parse(
         self,
         input_path: str | Path,
         exam_id: Optional[str] = None,
         out_dir: Optional[str | Path] = None,
     ) -> Exam:
-        """Chạy pipeline, trả về Exam đã điền crop + (tuỳ chọn) link MinIO."""
-        # Import nội bộ để tránh nạp Paddle khi chỉ cần class
-        from src.services.preprocess import preprocess
-        from src.services.paddle_parser import PaddleParser
-        from src.services.anchor_extractor import extract_anchors
-        from src.services.snake_walker import snake_walk, parse_exam_metadata
-        from src.services.question_classifier import classify_all
-        from src.schemas.exam import Exam, ExamMetadata  # noqa: F401
-
-        input_path = str(input_path)
+        """Chạy pipeline, GIỮ file ở ./output/{exam_id} (hành vi cũ, cho debug)."""
         exam_id = exam_id or str(uuid4())[:8]
         out = Path(out_dir) if out_dir else Path(settings.local_output_dir) / exam_id
         out.mkdir(parents=True, exist_ok=True)
-        source_file = Path(input_path).name
-        logger.info(f"[Pipeline] {input_path} → {out} (exam_id={exam_id})")
-
-        # 1. Preprocess
-        images = preprocess(input_path, dpi=self.dpi, do_deskew=self.do_deskew)
-
-        # 2. PaddleOCR
-        blocks_per_page = PaddleParser().parse_pages(images)
-
-        # 3. Anchor
-        anchors = extract_anchors(blocks_per_page)
-
-        # 4. Snake Walker
-        page_heights = [float(im.height) for im in images]
-        page_widths = [float(im.width) for im in images]
-        questions, groups, layouts, group_layouts = snake_walk(
-            blocks_per_page, anchors, page_heights, page_widths
+        return self._run_stages(
+            input_path, exam_id, out,
+            cleanup_local=False, raise_on_stage_error=False,
         )
 
+    def parse_to_json(self, input_path: str | Path, **kwargs) -> str:
+        """Như parse() nhưng trả thẳng chuỗi JSON."""
+        return self.parse(input_path, **kwargs).model_dump_json(indent=2)
+
+    # ============================================================
+    # Lõi dùng chung cho cả 2 chế độ
+    # ============================================================
+    def _run_stages(
+        self,
+        input_path: str | Path,
+        exam_id: str,
+        out: Path,
+        cleanup_local: bool,
+        raise_on_stage_error: bool,
+    ) -> Exam:
+        from src.schemas.exam import Exam
+
+        input_path = str(input_path)
+        source_file = Path(input_path).name
+
+        def stage(spec, fn):
+            """Chạy 1 stage; bọc lỗi thành PipelineStageError nếu bật raise."""
+            try:
+                return fn()
+            except PipelineStageError:
+                raise
+            except Exception as e:
+                logger.error(f"[Pipeline] stage {spec.stage} lỗi — {e}")
+                if raise_on_stage_error:
+                    raise PipelineStageError(spec, detail=str(e), exam_id=exam_id) from e
+                return None
+
+        # 1. Preprocess
+        from src.services.preprocess import preprocess
+        images = stage(ErrorCodes.PREPROCESS,
+                       lambda: preprocess(input_path, dpi=self.dpi, do_deskew=self.do_deskew))
+
+        # 2. PaddleOCR
+        from src.services.paddle_parser import PaddleParser
+        blocks_per_page = stage(ErrorCodes.OCR,
+                                lambda: PaddleParser().parse_pages(images))
+
+        # 3. Anchor
+        from src.services.anchor_extractor import extract_anchors
+        anchors = stage(ErrorCodes.ANCHOR, lambda: extract_anchors(blocks_per_page))
+
+        # 4. Snake Walker
+        from src.services.snake_walker import snake_walk, parse_exam_metadata
+        page_heights = [float(im.height) for im in images]
+        page_widths = [float(im.width) for im in images]
+        sw = stage(ErrorCodes.SNAKE, lambda: snake_walk(
+            blocks_per_page, anchors, page_heights, page_widths))
+        questions, groups, layouts, group_layouts = sw
+
         # 5. Classifier
-        classify_all(questions, groups)
+        from src.services.question_classifier import classify_all
+        stage(ErrorCodes.CLASSIFY, lambda: classify_all(questions, groups))
 
         # Build Exam
         metadata = parse_exam_metadata(anchors, blocks_per_page, len(questions))
@@ -104,12 +168,12 @@ class ExamPipeline:
                             if questions else 0.0),
         )
 
-        # 6. Cropper
+        # 6. Cropper + overlay
         if self.do_crop:
             from src.services.cropper import crop_all
-            crop_all(exam, layouts, group_layouts, images, out)
+            stage(ErrorCodes.CROP, lambda: crop_all(exam, layouts, group_layouts, images, out))
 
-            # (tuỳ chọn) 7. VLM Verify — mặc định TẮT
+            # (tuỳ chọn) VLM Verify — mặc định TẮT
             if self.do_vlm:
                 try:
                     from src.services.vlm_verifier import verify_exam
@@ -117,34 +181,31 @@ class ExamPipeline:
                 except Exception as e:
                     logger.error(f"[Pipeline] VLM verify lỗi — {e}")
 
-            # 8. MinIO upload (Phase 4) — file gốc + crop + exam.json
+            # 7. MinIO upload — raw + overlay + crops + exam.json
             raw_info = None
             if self.do_upload:
-                try:
+                def _upload():
+                    nonlocal raw_info
                     from src.services.minio_client import MinIOService
-                    from src.services.uploader import upload_exam_assets, upload_raw_file
+                    from src.services.uploader import (
+                        upload_exam_assets, upload_overlay, upload_raw_file,
+                    )
                     svc = MinIOService()
                     if settings.minio_save_raw:
                         raw_info = upload_raw_file(input_path, exam, exam_id=exam_id, svc=svc)
+                    upload_overlay(exam, out, exam_id=exam_id, svc=svc)
                     upload_exam_assets(exam, out, exam_id=exam_id, svc=svc)
-                except Exception as e:
-                    logger.error(f"[Pipeline] MinIO upload lỗi — {e} (giữ url local)")
+                stage(ErrorCodes.MINIO, _upload)
 
-            # 9. Lưu lịch sử MongoDB (1 đề = 1 bản ghi)
+            # 8. Lưu lịch sử MongoDB
             if self.do_mongo:
-                try:
+                def _mongo():
                     from src.services.mongo_client import MongoService
                     MongoService().save_exam(exam, raw=raw_info)
-                except Exception as e:
-                    logger.error(f"[Pipeline] Mongo save lỗi — {e}")
+                stage(ErrorCodes.MONGO, _mongo)
 
-        # Ghi exam.json (cấu trúc cuối)
-        (out / "exam.json").write_text(exam.model_dump_json(indent=2), encoding="utf-8")
+        # Ghi exam.json (local — CLI debug giữ lại; API sẽ xóa cùng thư mục tạm)
+        if not cleanup_local:
+            (out / "exam.json").write_text(exam.model_dump_json(indent=2), encoding="utf-8")
         logger.info(f"[Pipeline] xong: {len(exam.questions)} câu, {len(exam.groups)} nhóm")
         return exam
-
-    # ------------------------------------------------------------
-    def parse_to_json(self, input_path: str | Path, **kwargs) -> str:
-        """Như parse() nhưng trả thẳng chuỗi JSON (cấu trúc đã cắt + link MinIO)."""
-        exam = self.parse(input_path, **kwargs)
-        return exam.model_dump_json(indent=2)

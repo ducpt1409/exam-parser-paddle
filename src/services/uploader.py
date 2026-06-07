@@ -19,7 +19,7 @@ from typing import Optional
 
 from src.core.config import settings
 from src.core.logging import logger
-from src.schemas.exam import CroppedImage, Exam
+from src.schemas.exam import CroppedImage, Exam, OverlayImage
 from src.services.minio_client import MinIOService
 
 
@@ -114,6 +114,49 @@ def upload_raw_file(
     except Exception as e:
         logger.error(f"Upload raw lỗi {key} — {e}")
         return None
+
+
+def upload_overlay(
+    exam: Exam,
+    out_dir: Path,
+    exam_id: Optional[str] = None,
+    svc: Optional[MinIOService] = None,
+    presign: bool = True,
+) -> int:
+    """Upload toàn bộ ảnh overlay/page_XX.png lên MinIO; ghi vào exam.overlay.
+
+    Key: "{prefix}{exam_id}/overlay/page_XX.png". Trả về số ảnh đã upload.
+    Fail-safe: lỗi 1 trang → log + bỏ qua, không crash.
+    """
+    exam_id = exam_id or exam.exam_id
+    if svc is None:
+        svc = MinIOService()
+
+    overlay_dir = out_dir / "overlay"
+    if not overlay_dir.exists():
+        return 0
+
+    prefix = settings.minio_prefix or ""
+    items: list[OverlayImage] = []
+    n = 0
+    for png in sorted(overlay_dir.glob("page_*.png")):
+        # page_03.png → page_index 3
+        try:
+            page_index = int(png.stem.split("_")[-1])
+        except ValueError:
+            page_index = len(items)
+        key = f"{prefix}{exam_id}/overlay/{png.name}"
+        try:
+            svc.upload_file(png, key, content_type="image/png")
+            url = svc.presigned_url(key) if presign else svc.public_url(key)
+            items.append(OverlayImage(page_index=page_index, minio_key=key, url=url))
+            n += 1
+        except Exception as e:
+            logger.error(f"Upload overlay lỗi {key} — {e}")
+
+    exam.overlay = items
+    logger.info(f"MinIO: đã upload {n} ảnh overlay cho exam {exam_id}")
+    return n
 
 
 def upload_exam_assets(
